@@ -200,7 +200,7 @@
         
         <div class="mt-8 bg-aew-card rounded-xl border border-gray-800 p-4 max-w-md">
           <h3 class="font-semibold mb-3">Change Your PIN</h3>
-          <p class="text-xs text-gray-500 mb-3">Only you will know the new PIN. 1–10 letters or numbers, no special characters.</p>
+          <p class="text-xs text-gray-500 mb-3">Only you will know the new PIN. 4–10 letters or numbers, no special characters, and not a team name.</p>
           <input id="new-pin-input" type="text" maxlength="10" placeholder="New PIN" class="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm mb-2" />
           <input id="confirm-pin-input" type="text" maxlength="10" placeholder="Confirm new PIN" class="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm mb-3" />
           <button id="change-pin-btn" class="w-full bg-gray-700 hover:bg-gray-600 py-2 rounded-lg text-sm font-bold">Change PIN</button>
@@ -518,6 +518,15 @@
               <select id="season-add-div" class="bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm"></select>
               <button type="button" id="season-add-btn" class="bg-gray-700 hover:bg-gray-600 font-bold px-4 py-2 rounded-lg text-sm">Add Team</button>
             </div>
+          </div>
+          <div class="mt-4 pt-3 border-t border-gray-800">
+            <p class="text-xs text-gray-400 mb-2">Reset a team&apos;s PIN (forgotten PIN). Nobody can look PINs up, so this is the only way back in.</p>
+            <div class="flex flex-wrap gap-2 items-center">
+              <select id="reset-pin-team" class="bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm"></select>
+              <input id="reset-pin-new" type="text" maxlength="10" placeholder="New PIN" class="bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm w-32" />
+              <button type="button" id="reset-pin-btn" class="bg-gray-700 hover:bg-gray-600 font-bold px-4 py-2 rounded-lg text-sm">Reset PIN</button>
+            </div>
+            <p id="reset-pin-msg" class="text-sm mt-2"></p>
           </div>
         </div>
 

@@ -4541,12 +4541,49 @@ async function setDraftSchedule() {
   const when = new Date(`${date}T${time}`);
   if (isNaN(when.getTime())) return alert('Invalid date/time');
 
-  await window.supabaseClient.from('drafts').upsert({
-    division: div,
-    scheduled_at: when.toISOString(),
-    updated_at: new Date().toISOString()
-  });
-  alert(`${div.toUpperCase()} draft scheduled for ${when.toLocaleString()}`);
+  // Leftover state from a previous draft (complete, picks made, or an old locked
+  // order) would block the new one: no fresh order, no banner, "Draft complete".
+  const { draft: existing, picks: oldPicks } = await loadDraftState(div);
+  const st = existing?.status || 'idle';
+  if (st === 'active' || st === 'paused') {
+    return alert(`${div.toUpperCase()} draft is ${st}. Finish it before scheduling a new one.`);
+  }
+  const hasOrder = !!(existing?.order_locked || (existing?.order_pins || []).length);
+  const prevWhen = existing?.scheduled_at ? new Date(existing.scheduled_at).getTime() : NaN;
+  const oldOrder = hasOrder && (isNaN(prevWhen) || prevWhen < Date.now() - 24 * 60 * 60 * 1000);
+  const stale = !!existing && (st === 'complete' || (existing.current_pick || 0) > 0 || oldPicks.length > 0 || oldOrder);
+
+  if (stale) {
+    if (oldPicks.length && !confirm(
+      `Reset ${div.toUpperCase()} draft for the new date?\n\n` +
+      `This deletes the previous draft's ${oldPicks.length} picks and clears its order. ` +
+      `A new random order is made 15 minutes before the new start. Team rosters are NOT changed.`
+    )) return;
+    // Only reset if it is still not running (another commissioner tab could have started it)
+    const { data: reset, error } = await window.supabaseClient.from('drafts').update({
+      status: 'idle',
+      order_pins: [],
+      order_locked: false,
+      current_pick: 0,
+      started_at: null,
+      scheduled_at: when.toISOString(),
+      updated_at: new Date().toISOString()
+    }).eq('division', div).or('status.is.null,status.in.(idle,complete)').select('division');
+    if (error) return alert('Could not reset draft: ' + error.message);
+    if (!reset || !reset.length) return alert(`${div.toUpperCase()} draft changed state (started?). Nothing was reset — refresh and try again.`);
+    const { error: delErr } = await window.supabaseClient.from('draft_picks').delete().eq('division', div);
+    if (delErr) alert('Draft reset, but old picks could not be deleted: ' + delErr.message + '\n(Start Draft also clears them.)');
+  } else {
+    await window.supabaseClient.from('drafts').upsert({
+      division: div,
+      scheduled_at: when.toISOString(),
+      updated_at: new Date().toISOString()
+    });
+  }
+  const keptOrder = !stale && hasOrder;
+  alert(`${div.toUpperCase()} draft scheduled for ${when.toLocaleString()}` +
+    (stale ? '\nPrevious draft cleared. New order randomizes 15 minutes before start.' : '') +
+    (keptOrder ? '\nDraft order was already locked and stays the same.' : ''));
   updateDraftScheduleBanner();
   renderDraft();
 }

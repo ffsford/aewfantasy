@@ -366,7 +366,7 @@
       <section id="tab-draft" class="tab-content hidden">
         <div class="mb-6">
           <h2 class="text-xl font-bold mb-1">Draft Room</h2>
-          <p class="text-sm text-gray-400">You only see <strong>your division</strong>. When it is your turn: <strong>tap a wrestler</strong> → <strong>Submit Pick</strong> → confirm. Desktop can also drag onto the gold box. Order locks 15 minutes before start. Autopick list first; absent with no list = best available.</p>
+          <p class="text-sm text-gray-400">You only see <strong>your division</strong>. When it is your turn: <strong>tap a wrestler</strong> → <strong>Submit Pick</strong> → confirm. Desktop can also drag onto the gold box. Draft order is set and locked by the commissioner’s Draft Fight. <strong>Keep this Draft tab open</strong> — if you are not in the draft room when you are on the clock (about 15 seconds away), the system autopicks for you: your autopick list first, otherwise best available by last season’s points.</p>
         </div>
 
         <div id="draft-status-bar" class="bg-aew-card rounded-xl border border-gray-800 p-4 mb-6">
@@ -377,7 +377,7 @@
           <div class="flex flex-wrap items-start justify-between gap-3 mb-3">
             <div>
               <h3 class="font-bold text-aew-gold">Draft Fight — Order Spectacle</h3>
-              <p class="text-xs text-gray-400 mt-1">Watch this division’s order get decided on Draft Fight. Official league order still locks automatically 15 minutes before the scheduled start.</p>
+              <p class="text-xs text-gray-400 mt-1">The commissioner runs this division’s Draft Fight. Its finishing order becomes the official draft order and is locked — nobody can change it after that, including the commissioner.</p>
             </div>
             <a id="draft-fight-open" href="https://www.draftfight.com/create-battle" target="_blank" rel="noopener" class="text-xs bg-gray-700 hover:bg-gray-600 px-3 py-2 rounded-lg">Open in new tab</a>
           </div>
@@ -388,6 +388,16 @@
               <button type="button" id="draft-fight-save" class="bg-aew-gold text-black font-bold px-4 py-2 rounded-lg text-sm">Save URL</button>
             </div>
             <p id="draft-fight-msg" class="text-xs mt-1 text-gray-500"></p>
+          </div>
+          <div id="draft-fight-locked" class="hidden mb-3 p-3 rounded-lg border border-gray-800 bg-black/40 text-sm"></div>
+          <div id="draft-fight-lock-form" class="hidden mb-3 p-3 rounded-lg border border-aew-gold/40 bg-black/40">
+            <h4 class="text-sm font-semibold text-aew-gold mb-1">Lock Draft Fight result as the draft order</h4>
+            <p class="text-xs text-gray-400 mb-2">After the fight, paste its finishing order (winner first, one per line — extra filler fighters are ignored) and hit Fill, or set each pick below. Then Lock. This cannot be undone.</p>
+            <textarea id="draft-fight-paste" rows="4" class="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono mb-2" placeholder="1. Devin&#10;2. Josh&#10;..."></textarea>
+            <button type="button" id="draft-fight-parse" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded-lg text-xs font-bold mb-2">Fill from pasted result</button>
+            <div id="draft-fight-slots" class="space-y-1 mb-2"></div>
+            <button type="button" id="draft-fight-lock" class="bg-aew-red hover:bg-red-700 text-white font-bold px-4 py-2 rounded-lg text-sm">Lock Draft Order</button>
+            <p id="draft-fight-lock-msg" class="text-xs mt-1 text-gray-500"></p>
           </div>
           <div class="rounded-xl overflow-hidden border border-gray-800 bg-black">
             <iframe id="draft-fight-frame" title="Draft Fight" src="https://www.draftfight.com/create-battle" class="w-full h-[640px] bg-black" loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>
@@ -414,7 +424,7 @@
             <button id="draft-set-schedule" class="bg-aew-gold text-black font-bold px-4 py-2 rounded-lg text-sm">Set Schedule</button>
           </div>
           <div class="flex flex-wrap gap-2 mb-3">
-            <p class="text-xs text-gray-400 max-w-xs">Order randomizes and <strong class="text-white">locks 15 minutes before start</strong>. Nobody can change it after that — including commissioner.</p>
+            <p class="text-xs text-gray-400 max-w-xs">Order comes from the <strong class="text-white">Draft Fight</strong> above: run it, enter the result, lock it. Start Draft needs a locked order. Nobody can change it after that — including commissioner.</p>
             <button id="draft-start" class="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-lg text-sm font-bold">Start Draft</button>
             <button id="draft-pause" class="bg-yellow-600 hover:bg-yellow-500 px-4 py-2 rounded-lg text-sm font-medium">Pause</button>
             <button id="draft-resume" class="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-lg text-sm font-medium">Resume</button>

@@ -466,8 +466,27 @@
 
         <div class="bg-aew-card rounded-xl border border-emerald-700/60 p-4 mt-6">
           <h3 class="font-bold mb-1 text-emerald-400">Start New Season</h3>
-          <p class="text-xs text-gray-500 mb-3">Order: <strong class="text-gray-300">1. Start New Season</strong> → <strong class="text-gray-300">2. Season Lineup</strong> (who plays, which division) → <strong class="text-gray-300">3. Season Dates</strong> → <strong class="text-gray-300">4. Draft</strong> tab: schedule, run the Draft Fight, lock the order, Start Draft. Un-purges everyone, zeroes team points, roster size back to 8, clears last season’s finished drafts, removes held Foreign Objects, cancels open trades, clears waiver claims and the waiver deadline. Rosters are left alone (the draft replaces them).</p>
-          <button type="button" id="start-new-season-btn" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-5 py-2 rounded-lg text-sm">Start New Season</button>
+          <p class="text-xs text-gray-500 mb-3">Order: <strong class="text-gray-300">1. Start New Season</strong> (divisions + AEW roster below) → <strong class="text-gray-300">2. Season Lineup</strong> (who plays, which division) → <strong class="text-gray-300">3. Season Dates</strong> → <strong class="text-gray-300">4. Draft</strong> tab: schedule, run the Draft Fight, lock the order, Start Draft. Un-purges everyone, zeroes team points, roster size back to 8, clears last season’s finished drafts, removes held Foreign Objects, cancels open trades, clears waiver claims and the waiver deadline. Rosters are left alone (the draft replaces them).</p>
+          <div class="mb-3">
+            <label class="block text-xs text-gray-400 mb-1">1. How many divisions this season?</label>
+            <select id="nsn-div-count" class="bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm mb-2">
+              <option value="1">1 — Overall only</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+              <option value="6">6</option>
+              <option value="7">7</option>
+              <option value="8">8</option>
+            </select>
+            <div id="nsn-div-names" class="space-y-2"></div>
+          </div>
+          <div id="nsn-roster-mode-box" class="mb-3">
+            <p class="text-xs text-gray-400 mb-1">2. AEW roster</p>
+            <label class="flex items-start gap-2 text-sm mb-1"><input type="radio" name="nsn-roster-mode" value="shared" class="mt-1" /> <span><strong>One AEW roster</strong> for the whole league — each wrestler can be on only one team. Drafts, free agency, waivers and trades are league-wide.</span></label>
+            <label class="flex items-start gap-2 text-sm"><input type="radio" name="nsn-roster-mode" value="separate" class="mt-1" /> <span><strong>Each division gets its own AEW roster</strong> — the same wrestler can be on a team in every division.</span></label>
+          </div>
+          <button type="button" id="start-new-season-btn" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-5 py-2 rounded-lg text-sm">3. Start New Season</button>
         </div>
 
         <div class="bg-aew-card rounded-xl border border-aew-gold/40 p-4 mt-6">

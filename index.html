@@ -454,6 +454,28 @@
       <section id="tab-commissioner" class="tab-content hidden">
         <h2 class="text-xl font-bold text-aew-gold mb-4">Commissioner Tools</h2>
 
+        <div class="bg-aew-card rounded-xl border border-emerald-700/60 p-4 mt-6">
+          <h3 class="font-bold mb-1 text-emerald-400">Start New Season</h3>
+          <p class="text-xs text-gray-500 mb-3">Order: <strong class="text-gray-300">1. Start New Season</strong> → <strong class="text-gray-300">2. Season Lineup</strong> (who plays, which division) → <strong class="text-gray-300">3. Season Dates</strong> → <strong class="text-gray-300">4. Draft</strong> tab: schedule, run the Draft Fight, lock the order, Start Draft. Un-purges everyone, zeroes team points, roster size back to 8, clears last season’s finished drafts. Rosters are left alone (the draft replaces them).</p>
+          <button type="button" id="start-new-season-btn" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-5 py-2 rounded-lg text-sm">Start New Season</button>
+        </div>
+
+        <div class="bg-aew-card rounded-xl border border-aew-gold/40 p-4 mt-6">
+          <h3 class="font-bold mb-1 text-aew-gold">Season Lineup</h3>
+          <p class="text-xs text-gray-500 mb-3">Set each team’s division, or <strong class="text-gray-300">Not playing this season</strong> (keeps their PIN; they drop out of standings and the draft). Do this before running the Draft Fight.</p>
+          <div id="season-lineup-list" class="space-y-2 mb-3 text-sm"></div>
+          <button type="button" id="season-lineup-save" class="bg-aew-gold text-black font-bold px-5 py-2 rounded-lg text-sm mb-4">Save Lineup</button>
+          <div class="border-t border-gray-800 pt-3">
+            <p class="text-xs text-gray-400 mb-2">Add a new team / owner</p>
+            <div class="flex flex-wrap gap-2 items-end">
+              <input id="season-add-name" type="text" maxlength="40" placeholder="Owner name" class="bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm" />
+              <input id="season-add-pin" type="text" maxlength="10" placeholder="Starting PIN" class="bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm w-32" />
+              <select id="season-add-div" class="bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm"></select>
+              <button type="button" id="season-add-btn" class="bg-gray-700 hover:bg-gray-600 font-bold px-4 py-2 rounded-lg text-sm">Add Team</button>
+            </div>
+          </div>
+        </div>
+
         <div class="bg-aew-card rounded-xl border border-aew-gold/40 p-4 mt-6">
           <h3 class="font-bold mb-3 text-aew-gold">Season Dates</h3>
           <p class="text-xs text-gray-500 mb-3">Start and end of the season. Shown on the Calendar tab for everyone.</p>

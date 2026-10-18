@@ -605,6 +605,134 @@ async function saveSeasonDates(start, end) {
   data.seasonEnd = end || null;
 }
 
+// ---------- New season + season lineup (commissioner) ----------
+// A team "plays this season" when it has a division. Teams set to "Not playing"
+// get division = null (no schema change) — they drop out of standings, scoring,
+// the Purge and the draft, but keep their PIN and can be brought back later.
+
+async function draftBlocksLineupChange() {
+  const { data: drafts, error } = await window.supabaseClient.from('drafts').select('division, status, order_locked, order_pins');
+  if (error) return 'Could not check draft status: ' + error.message;
+  const running = (drafts || []).find(d => d.status === 'active' || d.status === 'paused');
+  if (running) return `${String(running.division).toUpperCase()} draft is ${running.status}. Wait until it is complete.`;
+  return null;
+}
+
+async function startNewSeason() {
+  if (guardReadOnly('start a new season')) return;
+  if (!isCommissioner()) return alert('Only the commissioner can start a new season.');
+  const blocked = await draftBlocksLineupChange();
+  if (blocked) return alert(blocked);
+  const teams = Object.entries(data.users || {}).filter(([pin, u]) => pin !== 'doublej' && u && !u.readOnly);
+  const purged = teams.filter(([, u]) => u.purged).map(([, u]) => u.name);
+  if (!confirm('Start a NEW SEASON?\n\n' +
+    `• Un-purge every team${purged.length ? ' (' + purged.join(', ') + ')' : ''}\n` +
+    '• Team standings points and last-show change go to 0\n' +
+    '• Roster size goes back to 8 (Foreign Object 9th spot ends)\n' +
+    '• Last season\u2019s finished drafts are cleared (picks, order, lock) so a new Draft Fight can run\n\n' +
+    'Record the Fantasy League Champion first — final standings points are wiped.\n' +
+    'Rosters are NOT touched (the draft overwrites them). Next: set teams below, then schedule the draft and run the Draft Fight.')) return;
+
+  const sb = window.supabaseClient;
+  const { error } = await sb.from('teams')
+    .update({ purged: false, points: 0, last_delta: null, max_roster: 8 })
+    .neq('pin', ''); // all teams
+  if (error) return alert('Could not reset teams: ' + error.message);
+
+  // Clear finished/stale drafts, but never one that is running (conditional on status)
+  const { data: drafts } = await sb.from('drafts').select('division, status, current_pick');
+  for (const d of drafts || []) {
+    const { data: reset } = await sb.from('drafts').update({
+      status: 'idle', order_pins: [], order_locked: false, current_pick: 0,
+      started_at: null, scheduled_at: null, updated_at: new Date().toISOString()
+    }).eq('division', d.division).or('status.is.null,status.in.(idle,complete)').select('division');
+    if (reset && reset.length) await sb.from('draft_picks').delete().eq('division', d.division);
+  }
+  await loadAllData();
+  renderCommissioner();
+  try { renderStandings(); } catch (e) {}
+  alert('New season started. Now set who is playing and their divisions under Season Lineup, then schedule the draft.');
+}
+
+function renderSeasonLineup() {
+  const el = document.getElementById('season-lineup-list');
+  if (!el) return;
+  const divs = getLeagueDivisions();
+  const opts = (cur) => divs.map(d => `<option value="${d}" ${cur === d ? 'selected' : ''}>${divisionLabel(d)}</option>`).join('') +
+    `<option value="" ${!cur ? 'selected' : ''}>Not playing this season</option>`;
+  const teams = Object.entries(data.users || {})
+    .filter(([pin, u]) => pin !== 'doublej' && u && !u.readOnly)
+    .sort((a, b) => String(a[1].division || 'zzz').localeCompare(String(b[1].division || 'zzz')) || String(a[1].name).localeCompare(String(b[1].name)));
+  el.innerHTML = teams.map(([pin, u]) => `
+    <div class="flex flex-wrap items-center gap-2 bg-black/40 rounded-lg px-3 py-2">
+      <span class="flex-1 min-w-[8rem] font-medium">${u.name}${u.isCommissioner ? ' \u2B50' : ''}${u.purged ? ' <span class="text-[10px] text-red-400 border border-red-500/60 rounded px-1">PURGED</span>' : ''}</span>
+      <select class="season-lineup-div bg-black border border-gray-700 rounded-lg px-2 py-1 text-sm" data-pin="${pin}">${opts(u.division ? String(u.division).toLowerCase() : '')}</select>
+      ${!u.division && !u.isCommissioner ? `<button type="button" class="season-lineup-delete text-xs text-red-400 hover:text-red-300" data-pin="${pin}">Delete team</button>` : ''}
+    </div>`).join('') || '<p class="text-gray-500 text-sm">No teams</p>';
+  el.querySelectorAll('.season-lineup-delete').forEach(b => b.addEventListener('click', () => deleteLeagueTeam(b.dataset.pin)));
+  const addDiv = document.getElementById('season-add-div');
+  if (addDiv) addDiv.innerHTML = divs.map(d => `<option value="${d}">${divisionLabel(d)}</option>`).join('');
+}
+
+async function saveSeasonLineup() {
+  if (guardReadOnly('change the season lineup')) return;
+  if (!isCommissioner()) return alert('Only the commissioner can set teams.');
+  const blocked = await draftBlocksLineupChange();
+  if (blocked) return alert(blocked);
+  const changes = [...document.querySelectorAll('.season-lineup-div')]
+    .map(sel => ({ pin: sel.dataset.pin, division: sel.value || null }))
+    .filter(c => (data.users[c.pin]?.division || null) !== c.division);
+  if (!changes.length) return alert('No changes.');
+  const { data: drafts } = await window.supabaseClient.from('drafts').select('division, status, order_locked, order_pins');
+  const touched = new Set(changes.flatMap(c => [data.users[c.pin]?.division, c.division]).filter(Boolean));
+  const locked = (drafts || []).filter(d => touched.has(d.division) && d.status === 'idle' && d.order_locked && (d.order_pins || []).length);
+  if (locked.length) return alert(`${locked.map(d => d.division.toUpperCase()).join(', ')} draft order is already locked by the Draft Fight. Set teams BEFORE running the Draft Fight.`);
+  if (!confirm('Save season lineup?\n\n' + changes.map(c => `${data.users[c.pin]?.name || c.pin}: ${c.division ? divisionLabel(c.division) : 'Not playing'}`).join('\n'))) return;
+  for (const c of changes) {
+    const { error } = await window.supabaseClient.from('teams').update({ division: c.division }).eq('pin', c.pin);
+    if (error) return alert('Could not update ' + (data.users[c.pin]?.name || c.pin) + ': ' + error.message);
+  }
+  await loadAllData();
+  renderCommissioner();
+  try { renderStandings(); } catch (e) {}
+  alert('Season lineup saved.');
+}
+
+async function addLeagueTeam() {
+  if (guardReadOnly('add a team')) return;
+  if (!isCommissioner()) return alert('Only the commissioner can add teams.');
+  const name = (document.getElementById('season-add-name')?.value || '').trim();
+  const pin = (document.getElementById('season-add-pin')?.value || '').trim().toLowerCase();
+  const division = document.getElementById('season-add-div')?.value || null;
+  if (!name) return alert('Enter the owner name.');
+  if (!pin || pin.length > 10 || !/^[a-z0-9]+$/.test(pin)) return alert('PIN must be 1–10 letters or numbers only.');
+  if (data.users[pin]) return alert('That PIN is already taken.');
+  const blocked = await draftBlocksLineupChange();
+  if (blocked) return alert(blocked);
+  if (!confirm(`Add ${name} (${division ? divisionLabel(division) : 'no division'}) with PIN "${pin}"?\n\nGive them the PIN privately — they can change it under My Team.`)) return;
+  const { error } = await window.supabaseClient.from('teams').insert({
+    pin, name, division, is_commissioner: false, max_roster: 8, roster: [], points: 0, last_delta: null, purged: false
+  });
+  if (error) return alert('Could not add team: ' + error.message);
+  document.getElementById('season-add-name').value = '';
+  document.getElementById('season-add-pin').value = '';
+  await loadAllData();
+  renderCommissioner();
+  alert(name + ' added.');
+}
+
+async function deleteLeagueTeam(pin) {
+  if (guardReadOnly('delete a team')) return;
+  if (!isCommissioner()) return;
+  const u = data.users[pin];
+  if (!u || u.division || u.isCommissioner) return alert('Set the team to "Not playing" first.');
+  if (!confirm(`DELETE ${u.name} from the league permanently?\n\nTheir PIN stops working and their waiver claims / Foreign Objects are deleted. "Not playing" already keeps them out of this season — only delete if they are gone for good.`)) return;
+  const { error } = await window.supabaseClient.from('teams').delete().eq('pin', pin);
+  if (error) return alert('Could not delete: ' + error.message);
+  await loadAllData();
+  renderCommissioner();
+}
+
 async function loadCalendarEvents() {
   data.calendarEvents = [];
   try {
@@ -2162,6 +2290,7 @@ function renderScoringTable() {
 
 function renderCommissioner() {
   try { fillDivisionSetupForm(); } catch (e) {}
+  try { renderSeasonLineup(); } catch (e) { console.warn(e); }
   try { renderCommishTradeQueue(); } catch (e) {}
   try { renderCalendarAdmin(); } catch (e) { console.warn(e); }
   try { fillWrestlerNameList(); } catch (e) {}
@@ -5744,6 +5873,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('spin-wheel')?.addEventListener('click', spinWheel);
   document.getElementById('div-setup-count')?.addEventListener('change', renderDivisionSetupNames);
   document.getElementById('div-setup-save')?.addEventListener('click', saveDivisionSetup);
+  document.getElementById('start-new-season-btn')?.addEventListener('click', startNewSeason);
+  document.getElementById('season-lineup-save')?.addEventListener('click', saveSeasonLineup);
+  document.getElementById('season-add-btn')?.addEventListener('click', addLeagueTeam);
   document.getElementById('flip-coin')?.addEventListener('click', flipCoin);
   document.getElementById('process-waivers')?.addEventListener('click', processWaivers);
   document.getElementById('set-waiver-deadline')?.addEventListener('click', setWaiverDeadlineUI);

@@ -4345,8 +4345,8 @@ function isDraftOwnerPresent(pin) {
 }
 
 async function tryAbsentAutopicks() {
-  // Runs in every connected (non view-only) client; the conditional update in
-  // makeDraftPick makes sure only one client's pick lands per slot.
+  // Runs in every connected (non view-only) client; make_draft_pick() in the
+  // database locks the draft row, so only one client's pick lands per slot.
   if (!window.supabaseClient || !currentUser) return;
   if (isReadOnlyViewer()) return;
   if (absentAutopickRunning) return;
@@ -4616,170 +4616,123 @@ async function setDraftStatus(division, status) {
 }
 
 
-async function zeroAllWrestlerPoints() {
-  if (isReadOnlyViewer()) return;
-  // New season: every wrestler starts at 0 after draft(s) finish
-  const { error } = await window.supabaseClient
-    .from('wrestler_points')
-    .update({ points: 0 })
-    .neq('name', ''); // all rows
-  if (error) {
-    // Fallback: update one-by-one
-    console.error('Bulk zero failed, trying per-row', error);
-    const { data: rows } = await window.supabaseClient.from('wrestler_points').select('name');
-    for (const r of rows || []) {
-      await window.supabaseClient.from('wrestler_points').update({ points: 0 }).eq('name', r.name);
-    }
-  }
-  // Update local cache
-  data.wrestlerPoints = data.wrestlerPoints || {};
-  Object.keys(data.wrestlerPoints).forEach(k => { data.wrestlerPoints[k] = 0; });
-  // Also zero any roster names not in table yet
-  for (const u of Object.values(data.users || {})) {
-    for (const w of (u.roster || [])) {
-      data.wrestlerPoints[w.toLowerCase().trim()] = 0;
-    }
-  }
-  console.log('All wrestler points reset to 0 for new season');
+// ---------- Draft picks: server-side and atomic ----------
+// Every pick goes through the database function make_draft_pick()
+// (supabase/migrations/20261018171500_atomic_draft_pick.sql). In one transaction it
+// locks the draft, checks it is active, that this is still the current pick, whose
+// turn it is (snake order), the PIN, and that the wrestler is in the pool and not
+// taken (roster-mode aware); then saves the pick and advances the board. On the
+// last pick it also marks the draft complete, writes the final rosters and, when
+// every draft is done, zeroes wrestler points. Autopicks: the server chooses the
+// wrestler (ranked list, then best available by prior-season / current points).
+// There is deliberately NO client-side fallback — if the function is missing,
+// picks stop with a "database update needed" message.
+const DRAFT_RPC_MISSING_MSG = 'Database update needed: the draft pick function (make_draft_pick) is not installed yet. ' +
+  'Picks are paused until the commissioner applies supabase/migrations/20261018171500_atomic_draft_pick.sql in Supabase.';
+let draftRpcMissing = false;
+
+function isMissingRpcError(err) {
+  if (!err) return false;
+  const msg = String(err.message || '') + ' ' + String(err.details || '') + ' ' + String(err.hint || '');
+  return err.code === 'PGRST202' || err.code === '42883' || err.status === 404 ||
+    /could not find the function|function .*make_draft_pick.* does not exist/i.test(msg);
 }
 
-async function maybeResetPointsAfterAllDraftsComplete() {
-  try {
-    const { data: drafts } = await window.supabaseClient.from('drafts').select('division, status');
-    const list = drafts || [];
-    // Still running?
-    if (list.some(d => d.status === 'active' || d.status === 'paused')) {
-      console.log('Another draft still in progress — points not reset yet');
-      return false;
-    }
-    // At least one complete?
-    if (!list.some(d => d.status === 'complete')) return false;
-    await zeroAllWrestlerPoints();
-    return true;
-  } catch (e) {
-    console.error('maybeResetPointsAfterAllDraftsComplete', e);
-    return false;
+function draftPickErrorMessage(res, division) {
+  switch (res && res.code) {
+    case 'not_active':
+      if (res.status === 'complete') return 'This draft is already complete.';
+      if (res.status === 'paused') return 'The draft is paused. Wait for the commissioner to resume it.';
+      return 'The draft is not running right now.';
+    case 'stale_pick': return 'That pick was already made — the board has moved on. Refreshed.';
+    case 'not_your_turn': return 'It\u2019s not your turn. The board has been refreshed.';
+    case 'already_taken':
+      if (res.taken_in_division && res.taken_in_division !== division) {
+        return (res.message || 'That wrestler is already drafted.') + ' (taken in ' + divisionLabel(res.taken_in_division) + ' \u2014 one AEW roster for the whole league). Pick someone else.';
+      }
+      return (res.message || 'That wrestler is already drafted.') + ' Pick someone else.';
+    case 'not_in_pool': return 'That wrestler isn\u2019t in the draft pool.';
+    case 'no_wrestler': return 'Choose a wrestler first.';
+    case 'bad_pin': return 'Your PIN can\u2019t make draft picks. Log out and back in.';
+    case 'no_order': return 'The draft order isn\u2019t locked yet. The commissioner needs to lock the Draft Fight result.';
+    case 'no_draft': return 'There is no draft set up for this division.';
+    case 'draft_complete': return 'This draft is already complete.';
+    case 'pool_empty': return 'No wrestlers left to pick.';
+    default: return (res && res.message) || 'Could not save the pick.';
   }
 }
 
+/**
+ * Make the current pick. Manual: `wrestler` is the owner's (or commissioner's) choice.
+ * Auto (isAuto): `wrestler` is ignored — the server chooses.
+ * expectedPick = the 0-based pick index the caller was looking at; the server rejects
+ * the call if the board has moved on. Returns true when this call's pick landed.
+ */
 async function makeDraftPick(division, wrestler, isAuto = false, expectedPick = null) {
   // Auto picks can run in the background on any client — no popups for them
   const fail = (m) => { if (isAuto) console.log('Autopick skipped:', m); else alert(m); return false; };
   if (isAuto ? isReadOnlyViewer() : guardReadOnly('draft')) return false;
-  const { draft, picks } = await loadDraftState(division);
-  if (!draft || draft.status !== 'active') return fail('Draft is not active');
+  if (!isAuto && !wrestler) return fail('Choose a wrestler first.');
 
-  const order = draft.order_pins || [];
-  const pickIndex = draft.current_pick || 0;
-  if (expectedPick !== null && pickIndex !== expectedPick) return fail('Pick already made');
-  const totalPicks = order.length * DRAFT_ROUNDS;
-  if (pickIndex >= totalPicks) return fail('Draft is complete');
-
-  const pin = getSnakePin(order, pickIndex);
-  const round = Math.floor(pickIndex / order.length) + 1;
-  const pickNumber = pickIndex + 1;
-
-  // Already taken? (this division, or the whole league with one shared AEW roster)
-  let taken;
-  try { taken = await loadDraftTaken(division, picks); } catch (e) { return fail(e.message); }
-  if (taken.has(wrestler.toLowerCase().trim())) return fail(isSharedRosterPool() ? 'Already drafted (one AEW roster for the whole league)' : 'Already drafted in this division');
-
-  const { data: inserted, error: insErr } = await window.supabaseClient.from('draft_picks').insert({
-    division,
-    pick_number: pickNumber,
-    round,
-    pin,
-    wrestler,
-    is_auto: isAuto
-  }).select('id').maybeSingle();
-  if (insErr) return fail('Could not save pick: ' + insErr.message);
-
-  // Shared roster: another division's draft may have taken the same wrestler at the
-  // same moment. The DB can't enforce that, so first-inserted row (lowest id) wins.
-  if (isSharedRosterPool() && inserted?.id) {
-    const esc = String(wrestler).replace(/[\\%_]/g, c => '\\' + c);
-    const { data: dupes } = await window.supabaseClient.from('draft_picks').select('id, division')
-      .ilike('wrestler', esc).neq('division', division);
-    const earlier = (dupes || []).find(d => d.id < inserted.id);
-    if (earlier) {
-      await window.supabaseClient.from('draft_picks').delete().eq('id', inserted.id);
-      renderDraft();
-      return fail(wrestler + ' was just drafted in ' + divisionLabel(earlier.division) + '. Pick someone else.');
-    }
+  let pickIndex = expectedPick;
+  if (pickIndex === null || pickIndex === undefined) {
+    const { draft } = await loadDraftState(division);
+    if (!draft || draft.status !== 'active') return fail('The draft is not running right now.');
+    pickIndex = draft.current_pick || 0;
   }
 
-  // Claim the slot: only advances if nobody else already did (still this pick, still active).
-  // If another client won the race, remove our duplicate row.
-  const nextPick = pickIndex + 1;
-  const done = nextPick >= totalPicks;
-  const { data: claimed, error: claimErr } = await window.supabaseClient.from('drafts').update({
-    current_pick: nextPick,
-    status: done ? 'complete' : 'active',
-    updated_at: new Date().toISOString()
-  }).eq('division', division).eq('current_pick', pickIndex).eq('status', 'active').select('division');
-  if (claimErr || !claimed || !claimed.length) {
-    if (inserted?.id) await window.supabaseClient.from('draft_picks').delete().eq('id', inserted.id);
+  const { data: res, error } = await window.supabaseClient.rpc('make_draft_pick', {
+    p_division: division,
+    p_pick_number: pickIndex + 1,
+    p_pin: currentUser,
+    p_wrestler: isAuto ? null : wrestler,
+    p_is_autopick: !!isAuto
+  });
+  if (error) {
+    if (isMissingRpcError(error)) {
+      const first = !draftRpcMissing;
+      draftRpcMissing = true;
+      if (first) console.error(DRAFT_RPC_MISSING_MSG, error);
+      if (!isAuto) alert(DRAFT_RPC_MISSING_MSG);
+      if (first) renderDraft();
+      return false;
+    }
     renderDraft();
-    return fail(claimErr ? 'Could not save pick: ' + claimErr.message : 'That pick was already made (or the draft was paused). Board refreshed.');
+    return fail('Could not save pick: ' + error.message);
   }
-  if (isAuto) console.log('Autopick:', division, '#' + pickNumber, data.users[pin]?.name || pin, '→', wrestler);
-
-  // If complete, write final rosters; when ALL division drafts are done, zero scores for new season
-  if (done) {
-    await finalizeDraftRosters(division);
-    const reset = await maybeResetPointsAfterAllDraftsComplete();
-    if (reset) {
-      alert('All drafts complete. Wrestler points reset to 0 for the new season.');
-    }
+  draftRpcMissing = false;
+  if (!res || !res.ok) {
+    renderDraft();
+    return fail(draftPickErrorMessage(res, division));
   }
 
+  if (isAuto) console.log('Autopick:', division, '#' + res.pick_number, res.team || '', '\u2192', res.wrestler);
+  if (res.completed) {
+    // The server already wrote the final rosters (and zeroed points if every draft is done)
+    await loadAllData();
+    alert(divisionLabel(division) + ' draft complete. Rosters updated.' +
+      (res.points_reset ? '\n\nAll drafts complete. Wrestler points reset to 0 for the new season.' : ''));
+  }
   renderDraft();
   return true;
 }
 
-async function finalizeDraftRosters(division) {
-  const { picks } = await loadDraftState(division);
-  const byPin = {};
-  (picks || []).forEach(p => {
-    if (!p.wrestler) return;
-    if (!byPin[p.pin]) byPin[p.pin] = [];
-    byPin[p.pin].push(p.wrestler);
-  });
-  for (const [pin, roster] of Object.entries(byPin)) {
-    await saveTeamRoster(pin, roster, 8);
-  }
-  alert(division.toUpperCase() + ' draft complete. Rosters updated.');
-}
-
 async function tryAutopick(division, reason = 'forced') {
   if (isReadOnlyViewer()) return false;
-  const { draft, picks } = await loadDraftState(division);
+  const { draft } = await loadDraftState(division);
   if (!draft || draft.status !== 'active') return false;
   const order = draft.order_pins || [];
   const pickIndex = draft.current_pick || 0;
   const pin = getSnakePin(order, pickIndex);
   if (!pin) return false;
   if (reason === 'absent') console.log('Owner absent from draft room — autopicking for', data.users[pin]?.name || pin);
-
-  const ranked = await loadAutopick(pin);
-  let taken;
-  try { taken = await loadDraftTaken(division, picks); } catch (e) { console.warn('autopick', e); return false; }
-  // Rosters are last season's until the draft finishes — only this season's picks count
-  const available = data.masterRoster.filter(w => !taken.has(w.toLowerCase().trim()));
-
-  // 1) Uploaded target / autopick list
-  for (const name of ranked) {
-    const match = available.find(a => a.toLowerCase() === name.toLowerCase());
-    if (match) {
-      return await makeDraftPick(division, match, true, pickIndex);
-    }
+  // The server picks: owner's ranked autopick list first, then best available by
+  // prior-season points (current points when there are none).
+  const ok = await makeDraftPick(division, null, true, pickIndex);
+  if (!ok && reason !== 'absent') {
+    alert(draftRpcMissing ? DRAFT_RPC_MISSING_MSG : 'Autopick did not go through \u2014 the pick may already have been made or the draft paused. Board refreshed.');
   }
-  // 2) No list / nothing left on list → best available by prior-season points
-  const bpa = available.slice().sort((a, b) => getDraftPts(b) - getDraftPts(a) || a.localeCompare(b));
-  if (bpa.length) {
-    return await makeDraftPick(division, bpa[0], true, pickIndex);
-  }
-  return false;
+  return ok;
 }
 
 async function renderDraft() {
@@ -4825,6 +4778,7 @@ async function renderDraft() {
       </div>
       ${d.scheduled_at ? `<div class="text-sm text-blue-300 mt-2">Scheduled: ${new Date(d.scheduled_at).toLocaleString()}</div>` : ''}
       ${orderNames ? `<div class="text-xs text-gray-500 mt-1">Order: ${orderNames}</div>` : ''}
+      ${draftRpcMissing ? `<div class="mt-2 text-sm text-red-300 bg-red-950/60 border border-red-800 rounded p-2">${DRAFT_RPC_MISSING_MSG}</div>` : ''}
     `;
   }
 
@@ -4885,7 +4839,7 @@ async function renderDraft() {
         const commitPick = () => {
           if (!selected) return;
           if (!confirm('Submit pick: ' + selected + '?')) return;
-          makeDraftPick(focusDiv, selected, false);
+          makeDraftPick(focusDiv, selected, false, d.current_pick || 0);
         };
         pickArea.querySelectorAll('.draft-pick-btn').forEach(btn => {
           btn.addEventListener('click', () => selectWrestler(btn.dataset.name));

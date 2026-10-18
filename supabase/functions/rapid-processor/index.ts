@@ -13,6 +13,33 @@ function json(body: unknown, status = 200) {
   });
 }
 
+// Division keys for this season, mirroring getDivisionSetup() / getLeagueDivisions() in
+// app.js: settings.division_setup in order; when it is not set, the divisions the teams
+// are in (east + west -> exactly ["east", "west"], the original behavior).
+function leagueDivisions(
+  rawSetup: string | undefined,
+  teams: any[],
+): { slugs: string[]; count: number } {
+  let setup: any = null;
+  try {
+    setup = rawSetup ? JSON.parse(rawSetup) : null;
+  } catch {
+    setup = null;
+  }
+  if (setup && Number(setup.count) >= 1 && Array.isArray(setup.names) && setup.names.length) {
+    const out: string[] = [];
+    for (const n of setup.names) {
+      const slug = String(n?.slug || "").trim();
+      if (slug && !out.includes(slug)) out.push(slug);
+    }
+    if (out.length) return { slugs: out, count: Number(setup.count) };
+  }
+  const slugs = [...new Set(teams.map((t: any) => t.division).filter(Boolean))] as string[];
+  if (slugs.includes("east") && slugs.includes("west")) return { slugs: ["east", "west"], count: 2 };
+  if (slugs.length >= 1) return { slugs: slugs.sort(), count: slugs.length };
+  return { slugs: ["east", "west"], count: 2 };
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -109,10 +136,23 @@ Deno.serve(async (req) => {
 
     const master = (masterRows || []).map((r: any) => r.name);
 
+    // Divisions (settings.division_setup, else east/west) and roster mode, mirroring
+    // getLeagueDivisions() / isSharedRosterPool() / processWaivers() in app.js.
+    const { data: modeSettings } = await supabase
+      .from("settings")
+      .select("key, value")
+      .in("key", ["division_setup", "roster_mode"]);
+    const modeMap: Record<string, string> = {};
+    (modeSettings || []).forEach((row: any) => (modeMap[row.key] = row.value));
+    const league = leagueDivisions(modeMap["division_setup"], teams || []);
+    // One division is always one shared AEW roster.
+    const shared = league.count === 1 || modeMap["roster_mode"] === "shared";
+
     function available(div: string) {
       const taken = new Set<string>();
       Object.values(users).forEach((u: any) => {
-        if (u.division === div && !u.purged) {
+        // Shared roster: a wrestler on ANY team is taken. Separate: only this division.
+        if (shared || (u.division === div && !u.purged)) {
           (u.roster || []).forEach((w: string) =>
             taken.add(String(w).toLowerCase().trim()),
           );
@@ -121,18 +161,26 @@ Deno.serve(async (req) => {
       return master.filter((n) => !taken.has(String(n).toLowerCase().trim()));
     }
 
+    // Separate rosters: each division runs on its own (original behavior, east then west).
+    // Shared roster: one league-wide pass, worst points first across the league.
+    const groups: string[][] = shared ? [league.slugs] : league.slugs.map((d) => [d]);
+
     const results: string[] = [];
 
-    for (const div of ["east", "west"]) {
-      const { data: sett } = await supabase
-        .from("settings")
-        .select("value")
-        .eq("key", "waiver_disrupter_" + div)
-        .maybeSingle();
-      const disrupterPin = sett?.value || null;
+    for (const groupDivs of groups) {
+      // Waiver Disrupter is per division (blocks the others in the activator's division)
+      const disrupters: Record<string, string> = {};
+      for (const d of groupDivs) {
+        const { data: sett } = await supabase
+          .from("settings")
+          .select("value")
+          .eq("key", "waiver_disrupter_" + d)
+          .maybeSingle();
+        if (sett?.value) disrupters[d] = sett.value;
+      }
 
       const order = Object.entries(users)
-        .filter(([_, u]) => u.division === div && !u.purged)
+        .filter(([_, u]) => groupDivs.includes(u.division) && !u.purged)
         .map(([pin, u]) => ({
           pin,
           name: u.name,
@@ -146,6 +194,8 @@ Deno.serve(async (req) => {
       for (const team of order) {
         const claim = claimMap[team.pin];
         if (!claim?.ranked?.length) continue;
+        const div = users[team.pin].division;
+        const disrupterPin = disrupters[div] || null;
 
         if (disrupterPin && team.pin !== disrupterPin) {
           results.push(
@@ -229,11 +279,11 @@ Deno.serve(async (req) => {
         if (!hits) results.push(`❌ ${team.name} — no claims filled`);
       }
 
-      if (disrupterPin) {
+      for (const d of Object.keys(disrupters)) {
         await supabase
           .from("settings")
           .delete()
-          .eq("key", "waiver_disrupter_" + div);
+          .eq("key", "waiver_disrupter_" + d);
       }
     }
 

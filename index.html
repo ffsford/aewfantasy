@@ -469,16 +469,7 @@
           <p class="text-xs text-gray-500 mb-3">Order: <strong class="text-gray-300">1. Start New Season</strong> (divisions, AEW roster and roster spots below) → <strong class="text-gray-300">2. Season Lineup</strong> (who plays, which division) → <strong class="text-gray-300">3. Season Dates</strong> → <strong class="text-gray-300">4. Draft</strong> tab: schedule, run the Draft Fight, lock the order, Start Draft. Saves the ending season&apos;s champion to Past Champions and switches to the new season name. Un-purges everyone, zeroes team points, sets every roster to the spots you choose, clears last season’s finished drafts, removes held Foreign Objects, cancels open trades, clears waiver claims and the waiver deadline. Rosters are left alone (the draft replaces them).</p>
           <div class="mb-3">
             <label class="block text-xs text-gray-400 mb-1">1. How many divisions this season?</label>
-            <select id="nsn-div-count" class="bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm mb-2">
-              <option value="1">1 — Overall only</option>
-              <option value="2">2</option>
-              <option value="3">3</option>
-              <option value="4">4</option>
-              <option value="5">5</option>
-              <option value="6">6</option>
-              <option value="7">7</option>
-              <option value="8">8</option>
-            </select>
+            <input id="nsn-div-count" type="number" min="1" max="50" step="1" inputmode="numeric" value="2" class="w-24 bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-white mb-2" /> <span class="text-xs text-gray-500">1 = Overall only. Any number up to 50.</span>
             <div id="nsn-div-names" class="space-y-2"></div>
           </div>
           <div id="nsn-roster-mode-box" class="mb-3">
@@ -551,16 +542,7 @@
           <h3 class="font-bold mb-1 text-aew-gold">Divisions</h3>
           <p class="text-xs text-gray-500 mb-3">One division: the standings page is Overall only. More than one: you must name each division. Those names are the boards above Overall.</p>
           <label class="block text-xs text-gray-400 mb-1">How many divisions?</label>
-          <select id="div-setup-count" class="bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm mb-3">
-            <option value="1">1 — Overall only</option>
-            <option value="2">2</option>
-            <option value="3">3</option>
-            <option value="4">4</option>
-            <option value="5">5</option>
-            <option value="6">6</option>
-            <option value="7">7</option>
-            <option value="8">8</option>
-          </select>
+          <input id="div-setup-count" type="number" min="1" max="50" step="1" inputmode="numeric" value="2" class="w-24 bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-white mb-3" /> <span class="text-xs text-gray-500">1 = Overall only. Any number up to 50.</span>
           <div id="div-setup-names" class="space-y-2 mb-3"></div>
           <p id="div-setup-hint" class="text-xs text-gray-500 mb-3">One division. Standings stay under Overall. No division name.</p>
           <button type="button" id="div-setup-save" class="bg-aew-gold text-black font-bold px-5 py-2 rounded-lg text-sm">Save divisions</button>

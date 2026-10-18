@@ -29,6 +29,38 @@ function parsePurgeAt(raw: string): Date | null {
   return new Date(Date.UTC(y, mo - 1, day, hh + 4, mm, ss)); // Aug = EDT
 }
 
+// Division keys for this season, mirroring getLeagueDivisions() / defaultDivisionSetup()
+// in app.js: settings.division_setup names in order; when it is not set, the divisions
+// the teams are in (east + west -> exactly ["east", "west"], the original behavior).
+function leagueDivisions(rawSetup: string | undefined, teams: any[]): string[] {
+  let setup: any = null;
+  try {
+    setup = rawSetup ? JSON.parse(rawSetup) : null;
+  } catch {
+    setup = null;
+  }
+  if (setup && Number(setup.count) >= 1 && Array.isArray(setup.names) && setup.names.length) {
+    const out: string[] = [];
+    for (const n of setup.names) {
+      const slug = String(n?.slug || "").toLowerCase().trim();
+      if (slug && !out.includes(slug)) out.push(slug);
+    }
+    if (out.length) return out;
+  }
+  const slugs = [
+    ...new Set(teams.map((t: any) => String(t.division || "").toLowerCase()).filter(Boolean)),
+  ];
+  if (slugs.includes("east") && slugs.includes("west")) return ["east", "west"];
+  if (slugs.length >= 1) return slugs.sort();
+  return ["east", "west"];
+}
+
+// "A and B" (unchanged for 2 divisions), "A, B and C" for more
+function joinNames(names: string[]): string {
+  if (names.length <= 2) return names.join(" and ");
+  return names.slice(0, -1).join(", ") + " and " + names[names.length - 1];
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
 
@@ -88,9 +120,11 @@ Deno.serve(async (req) => {
       return list[0] || null;
     };
 
-    const east = lastPlace("east");
-    const west = lastPlace("west");
-    const victims = [east, west].filter(Boolean);
+    // Every division of the season (settings.division_setup), in the commissioner's
+    // order. Not set (the league before its first Start New Season) = east, west.
+    const divisions = leagueDivisions(map["division_setup"], teams || []);
+    const byDiv = divisions.map((div) => ({ div, v: lastPlace(div) }));
+    const victims = byDiv.map((x) => x.v).filter(Boolean);
     const names: string[] = [];
 
     for (const v of victims) {
@@ -98,14 +132,24 @@ Deno.serve(async (req) => {
       names.push(`${v.division}:${v.name} (${v.points})`);
     }
 
+    const east = byDiv.find((x) => x.div === "east")?.v || null;
+    const west = byDiv.find((x) => x.div === "west")?.v || null;
     await supabase
       .from("purge_log")
       .update({ east_pin: east?.pin || null, west_pin: west?.pin || null })
       .eq("scheduled_for", whenStr);
+    // Every division's victim. Separate update: if the purge_log.victims column is
+    // missing (migration not applied yet) only this write fails; the purge stands.
+    const victimMap: Record<string, string> = {};
+    for (const x of byDiv) if (x.v) victimMap[x.div] = x.v.pin;
+    await supabase
+      .from("purge_log")
+      .update({ victims: victimMap })
+      .eq("scheduled_for", whenStr);
 
     const msg =
       "RED ALERT: PURGE complete. " +
-      names.join(" and ") +
+      joinNames(names) +
       " have been removed. Their rosters are in free agency.";
     for (const t of teams || []) {
       if (t.pin && t.division) {

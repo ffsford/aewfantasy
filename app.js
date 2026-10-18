@@ -974,20 +974,55 @@ async function addLeagueTeam() {
   const pin = (document.getElementById('season-add-pin')?.value || '').trim().toLowerCase();
   const division = document.getElementById('season-add-div')?.value || null;
   if (!name) return alert('Enter the owner name.');
-  if (!pin || pin.length > 10 || !/^[a-z0-9]+$/.test(pin)) return alert('PIN must be 1–10 letters or numbers only.');
-  if (data.users[pin]) return alert('That PIN is already taken.');
+  if (!pin || pin.length < 4 || pin.length > 10 || !/^[a-z0-9]+$/.test(pin)) return alert('PIN must be 4–10 letters or numbers only.');
   const blocked = await draftBlocksLineupChange();
   if (blocked) return alert(blocked);
   if (!confirm(`Add ${name} (${division ? divisionLabel(division) : 'no division'}) with PIN "${pin}"?\n\nGive them the PIN privately — they can change it under My Team.`)) return;
-  const { error } = await window.supabaseClient.from('teams').insert({
-    pin, name, division, is_commissioner: false, max_roster: getSeasonRosterSpots(), roster: [], points: 0, last_delta: null, purged: false
+  const token = getSessionToken();
+  if (!token) return alert('Your login has expired. Log out and log in again.');
+  const { data: res, error } = await window.supabaseClient.rpc('add_league_team', {
+    p_token: token, p_name: name, p_pin: pin, p_division: division, p_max_roster: getSeasonRosterSpots()
   });
-  if (error) return alert(isDivisionCheckError(error) ? DIVISION_MIGRATION_MSG : 'Could not add team: ' + error.message);
+  if (error) return alert(isAuthRpcMissing(error) ? LOGIN_RPC_MISSING_MSG : 'Could not add team: ' + error.message);
+  if (!res || !res.ok) return alert(res && res.code === 'division_check' ? DIVISION_MIGRATION_MSG : 'Could not add team: ' + ((res && res.message) || 'unknown error'));
   document.getElementById('season-add-name').value = '';
   document.getElementById('season-add-pin').value = '';
   await loadAllData();
   renderCommissioner();
   alert(name + ' added.');
+}
+
+function fillResetPinSelect() {
+  const sel = document.getElementById('reset-pin-team');
+  if (!sel) return;
+  const cur = sel.value;
+  const teams = Object.entries(data.users || {})
+    .filter(([pin, u]) => pin !== 'doublej' && u && !u.readOnly)
+    .sort((a, b) => String(a[1].name).localeCompare(String(b[1].name)));
+  sel.innerHTML = '<option value="">Choose a team\u2026</option>' +
+    teams.map(([pin, u]) => `<option value="${escHtml(pin)}">${escHtml(u.name)}</option>`).join('');
+  if (cur) sel.value = cur;
+}
+
+async function commishResetPin() {
+  if (guardReadOnly('reset a PIN')) return;
+  if (!isCommissioner()) return alert('Only the commissioner can reset PINs.');
+  const team = document.getElementById('reset-pin-team')?.value || '';
+  const inp = document.getElementById('reset-pin-new');
+  const pin = (inp?.value || '').trim().toLowerCase();
+  const msg = document.getElementById('reset-pin-msg');
+  const say = (t, cls) => { if (msg) { msg.textContent = t; msg.className = 'text-sm mt-2 ' + cls; } };
+  if (!team) return say('Choose a team.', 'text-red-400');
+  if (!pin || pin.length < 4 || pin.length > 10 || !/^[a-z0-9]+$/.test(pin)) return say('PIN must be 4\u201310 letters or numbers only.', 'text-red-400');
+  const name = data.users[team]?.name || team;
+  if (!confirm(`Set a new PIN for ${name}?\n\nTheir old PIN stops working and they are logged out everywhere. Give them the new PIN privately; they can change it under My Team.`)) return;
+  const token = getSessionToken();
+  if (!token) return say('Your login has expired. Log out and log in again.', 'text-red-400');
+  const { data: res, error } = await window.supabaseClient.rpc('commish_set_team_pin', { p_token: token, p_team: team, p_new_pin: pin });
+  if (error) return say(isAuthRpcMissing(error) ? LOGIN_RPC_MISSING_MSG : 'Could not reset: ' + error.message, 'text-red-400');
+  if (!res || !res.ok) return say((res && res.message) || 'Could not reset the PIN.', 'text-red-400');
+  if (inp) inp.value = '';
+  say('New PIN set for ' + name + '.', 'text-emerald-400');
 }
 
 async function deleteLeagueTeam(pin) {
@@ -996,8 +1031,11 @@ async function deleteLeagueTeam(pin) {
   const u = data.users[pin];
   if (!u || u.division || u.isCommissioner) return alert('Set the team to "Not playing" first.');
   if (!confirm(`DELETE ${u.name} from the league permanently?\n\nTheir PIN stops working and their waiver claims / Foreign Objects are deleted. "Not playing" already keeps them out of this season — only delete if they are gone for good.`)) return;
-  const { error } = await window.supabaseClient.from('teams').delete().eq('pin', pin);
-  if (error) return alert('Could not delete: ' + error.message);
+  const token = getSessionToken();
+  if (!token) return alert('Your login has expired. Log out and log in again.');
+  const { data: res, error } = await window.supabaseClient.rpc('delete_league_team', { p_token: token, p_team: pin });
+  if (error) return alert(isAuthRpcMissing(error) ? LOGIN_RPC_MISSING_MSG : 'Could not delete: ' + error.message);
+  if (!res || !res.ok) return alert('Could not delete: ' + ((res && res.message) || 'unknown error'));
   await loadAllData();
   renderCommissioner();
 }
@@ -1518,7 +1556,6 @@ async function loadAllData() {
     };
     data.points[pinKey] = t.points || 0;
   });
-  console.log('Loaded PINs:', Object.keys(data.users));
 
   // Read-only observer PIN (view everything, change nothing)
   data.users['doublej'] = {
@@ -1740,23 +1777,76 @@ async function setWaiverDeadline(iso) {
 }
 
 // ---------- Auth ----------
-function login(pin) {
-  pin = (pin || '').trim().toLowerCase();
-  console.log('Login attempt:', pin, 'Available:', Object.keys(data.users));
-  if (!pin || pin.length > 10 || !/^[a-z0-9]+$/i.test(pin)) {
+// Logins go through the login_with_pin() database function. The browser only keeps
+// its own opaque session token (localStorage), never anyone's PIN. The read-only
+// viewer (doublej) has no session and no rights.
+const SESSION_KEY = 'aew_session_v1';
+const VIEWER_KEY = 'aew_viewer_v1';
+const LEGACY_PIN_KEY = 'aew_current_pin'; // pre-session logins: cleared, owner logs in once
+const LOGIN_RPC_MISSING_MSG = 'Login is being updated. Wait a minute, then hard-refresh the page and try again.';
+
+function getSessionToken() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+    return (s && typeof s.token === 'string' && s.token) || null;
+  } catch (e) { return null; }
+}
+function saveSession(token, team) {
+  localStorage.setItem(SESSION_KEY, JSON.stringify({ token, team }));
+  localStorage.removeItem(VIEWER_KEY);
+  localStorage.removeItem(LEGACY_PIN_KEY);
+}
+function clearSession() {
+  localStorage.removeItem(SESSION_KEY);
+  localStorage.removeItem(VIEWER_KEY);
+  localStorage.removeItem(LEGACY_PIN_KEY);
+}
+function isAuthRpcMissing(err) {
+  if (!err) return false;
+  const msg = String(err.message || '') + ' ' + String(err.details || '');
+  return err.code === 'PGRST202' || err.code === '42883' || err.status === 404 || /could not find the function/i.test(msg);
+}
+
+// Returns { ok, error?, pinIsTeamId? }. Sets currentUser on success.
+async function loginWithPin(pin) {
+  pin = String(pin || '').trim().toLowerCase();
+  if (!pin || pin.length > 10 || !/^[a-z0-9]+$/.test(pin)) {
     return { ok: false, error: 'PIN must be 1-10 letters or numbers only' };
   }
-  if (!data.users[pin]) {
-    return { ok: false, error: 'PIN not found. Available: ' + Object.keys(data.users).join(', ') };
+  const { data: res, error } = await window.supabaseClient.rpc('login_with_pin', { p_pin: pin });
+  if (error) return { ok: false, error: isAuthRpcMissing(error) ? LOGIN_RPC_MISSING_MSG : 'Login failed: ' + (error.message || error) };
+  if (!res || !res.ok) return { ok: false, error: (res && res.message) || 'Wrong PIN.' };
+  if (res.viewer) {
+    clearSession();
+    localStorage.setItem(VIEWER_KEY, '1');
+    currentUser = 'doublej';
+    return { ok: true, viewer: true };
   }
-  currentUser = pin;
-  localStorage.setItem('aew_current_pin', pin);
-  return { ok: true };
+  const team = String(res.team || '').trim().toLowerCase();
+  if (!team || !res.token) return { ok: false, error: 'Login failed. Try again.' };
+  saveSession(res.token, team);
+  currentUser = team;
+  return { ok: true, pinIsTeamId: !!res.pin_is_team_id };
+}
+
+// Page load: restore the login from the saved session token. Returns true when logged in.
+async function restoreSession() {
+  if (localStorage.getItem(LEGACY_PIN_KEY)) localStorage.removeItem(LEGACY_PIN_KEY); // old-style login: log in again once
+  if (localStorage.getItem(VIEWER_KEY) === '1') { currentUser = 'doublej'; return true; }
+  const token = getSessionToken();
+  if (!token) return false;
+  const { data: res, error } = await window.supabaseClient.rpc('session_info', { p_token: token });
+  if (error) { console.warn('session check failed', error.message || error); return false; } // keep token: may be a network blip
+  if (!res || !res.ok || !res.team) { clearSession(); return false; }
+  currentUser = String(res.team).trim().toLowerCase();
+  return true;
 }
 
 function logout() {
+  const token = getSessionToken();
+  if (token) { try { window.supabaseClient.rpc('logout_session', { p_token: token }).then(() => {}, () => {}); } catch (e) {} }
   currentUser = null;
-  localStorage.removeItem('aew_current_pin');
+  clearSession();
   document.getElementById('app').classList.add('hidden');
   document.getElementById('login-screen').classList.remove('hidden');
   document.getElementById('pin-input').value = '';
@@ -2574,6 +2664,7 @@ function renderCommissioner() {
   try { fillDivisionSetupForm(); } catch (e) {}
   try { renderSeasonLineup(); } catch (e) { console.warn(e); }
   try { fillNewSeasonForm(); } catch (e) { console.warn(e); }
+  try { fillResetPinSelect(); } catch (e) {}
   try { fillNewSeasonChampionAndName(); } catch (e) { console.warn(e); }
   try { wirePastChampionsEditor(); fillSeasonNameEditor(); renderPastChampionsEditor(); } catch (e) { console.warn(e); }
   try {
@@ -3142,12 +3233,12 @@ async function setWaiverDeadlineUI() {
 async function enterApp() {
   const u = data.users[currentUser];
   if (!u) {
-    console.error('enterApp: no user for', currentUser, Object.keys(data.users || {}));
+    console.error('enterApp: team not found for this login');
     document.getElementById('login-screen')?.classList.remove('hidden');
     document.getElementById('app')?.classList.add('hidden');
     const err = document.getElementById('login-error');
     if (err) {
-      err.textContent = 'PIN session lost. Try again.';
+      err.textContent = 'Your login could not be restored. Log in again.';
       err.classList.remove('hidden');
     }
     return;
@@ -3798,76 +3889,35 @@ window.showTradeModal = showTradeModal;
 
 
 
+// Shown once after logging in with a PIN that is still the team's public ID.
+function nudgePinChange() {
+  if (!currentUser || isReadOnlyViewer()) return;
+  if (confirm('Your PIN is the same as your team ID, which other people can see in the app.\n\nChoose a new PIN that only you know? (My Team \u2192 Change Your PIN)')) {
+    try { showTab('myteam'); } catch (e) {}
+    setTimeout(() => document.getElementById('new-pin-input')?.focus(), 200);
+  }
+}
+
 async function changePin() {
   const newPin = (document.getElementById('new-pin-input')?.value || '').trim().toLowerCase();
   const confirmPin = (document.getElementById('confirm-pin-input')?.value || '').trim().toLowerCase();
   const msg = document.getElementById('change-pin-msg');
+  const say = (t, cls) => { if (msg) { msg.textContent = t; msg.className = 'text-sm mt-2 ' + cls; } };
+  if (guardReadOnly('change a PIN')) return;
 
-  if (!newPin || newPin.length > 10 || !/^[a-z0-9]+$/i.test(newPin)) {
-    if (msg) { msg.textContent = 'PIN must be 1–10 letters or numbers only'; msg.className = 'text-sm mt-2 text-red-400'; }
-    return;
-  }
-  if (newPin !== confirmPin) {
-    if (msg) { msg.textContent = 'PINs do not match'; msg.className = 'text-sm mt-2 text-red-400'; }
-    return;
-  }
-  if (data.users[newPin]) {
-    if (msg) { msg.textContent = 'That PIN is already taken'; msg.className = 'text-sm mt-2 text-red-400'; }
-    return;
-  }
-  if (newPin === currentUser) {
-    if (msg) { msg.textContent = 'That is already your PIN'; msg.className = 'text-sm mt-2 text-yellow-400'; }
-    return;
-  }
+  if (!newPin || newPin.length < 4 || newPin.length > 10 || !/^[a-z0-9]+$/.test(newPin)) return say('PIN must be 4\u201310 letters or numbers only', 'text-red-400');
+  if (newPin !== confirmPin) return say('PINs do not match', 'text-red-400');
+  const token = getSessionToken();
+  if (!token) return say('Your login has expired. Log out and log in again.', 'text-red-400');
 
-  const oldPin = currentUser;
-  const sb = window.supabaseClient;
+  const { data: res, error } = await window.supabaseClient.rpc('change_my_pin', { p_token: token, p_new_pin: newPin });
+  if (error) return say(isAuthRpcMissing(error) ? LOGIN_RPC_MISSING_MSG : 'Error changing PIN: ' + (error.message || error), 'text-red-400');
+  if (!res || !res.ok) return say((res && res.message) || 'Could not change the PIN.', res && res.code === 'same_pin' ? 'text-yellow-400' : 'text-red-400');
 
-  try {
-    // 1. Create the new team row (copy of old)
-    const old = data.users[oldPin];
-    const { error: insertErr } = await sb.from('teams').insert({
-      pin: newPin,
-      name: old.name,
-      division: old.division,
-      is_commissioner: old.isCommissioner,
-      max_roster: old.maxRoster,
-      roster: old.roster || [],
-      points: data.points[oldPin] || 0
-    });
-    if (insertErr) throw insertErr;
-
-    // 2. Move related data
-    await sb.from('claims').update({ pin: newPin }).eq('pin', oldPin);
-    await sb.from('foreign_objects').update({ pin: newPin }).eq('pin', oldPin);
-    await sb.from('trades').update({ from_pin: newPin }).eq('from_pin', oldPin);
-    await sb.from('trades').update({ to_pin: newPin }).eq('to_pin', oldPin);
-
-    // 3. Delete the old team row
-    await sb.from('teams').delete().eq('pin', oldPin);
-
-    // 4. Update local state and re-login
-    data.users[newPin] = { ...old };
-    data.points[newPin] = data.points[oldPin] || 0;
-    delete data.users[oldPin];
-    delete data.points[oldPin];
-
-    currentUser = newPin;
-    localStorage.setItem('aew_current_pin', newPin);
-
-    if (msg) {
-      msg.textContent = `PIN changed to "${newPin}". You are now logged in with the new PIN.`;
-      msg.className = 'text-sm mt-2 text-emerald-400';
-    }
-    document.getElementById('new-pin-input').value = '';
-    document.getElementById('confirm-pin-input').value = '';
-    document.getElementById('user-badge').textContent = data.users[newPin].name + (data.users[newPin].isCommissioner ? ' ⭐' : '');
-
-    alert(`Your PIN is now: ${newPin}\n\nRemember it — Ford will not know this PIN.`);
-  } catch (err) {
-    console.error(err);
-    if (msg) { msg.textContent = 'Error changing PIN: ' + (err.message || err); msg.className = 'text-sm mt-2 text-red-400'; }
-  }
+  document.getElementById('new-pin-input').value = '';
+  document.getElementById('confirm-pin-input').value = '';
+  say('PIN changed. Use the new PIN next time you log in. Other devices logged in as you were signed out.', 'text-emerald-400');
+  alert('Your PIN has been changed.\n\nRemember it \u2014 nobody else can see it, not even the commissioner.');
 }
 
 
@@ -4814,6 +4864,8 @@ function draftPickErrorMessage(res, division) {
     case 'not_in_pool': return 'That wrestler isn\u2019t in the draft pool.';
     case 'no_wrestler': return 'Choose a wrestler first.';
     case 'bad_pin': return 'Your PIN can\u2019t make draft picks. Log out and back in.';
+    case 'bad_session': return 'Your login has expired. Log out and log in again to make picks.';
+    case 'reload_required': return 'This page is out of date. Reload the page and log in again.';
     case 'no_order': return 'The draft order isn\u2019t locked yet. The commissioner needs to lock the Draft Fight result.';
     case 'no_draft': return 'There is no draft set up for this division.';
     case 'draft_complete': return 'This draft is already complete.';
@@ -4844,7 +4896,7 @@ async function makeDraftPick(division, wrestler, isAuto = false, expectedPick = 
   const { data: res, error } = await window.supabaseClient.rpc('make_draft_pick', {
     p_division: division,
     p_pick_number: pickIndex + 1,
-    p_pin: currentUser,
+    p_pin: getSessionToken() || '', // session token (parameter name kept for compatibility)
     p_wrestler: isAuto ? null : wrestler,
     p_is_autopick: !!isAuto
   });
@@ -6248,13 +6300,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       err.classList.remove('hidden');
     }
   }
-  const savedPin = (localStorage.getItem('aew_current_pin') || '').trim().toLowerCase();
-  if (savedPin && data.users[savedPin]) {
-    currentUser = savedPin;
+  let restored = false;
+  try { restored = await restoreSession(); } catch (e) { console.warn('restoreSession', e); }
+  if (restored && data.users[currentUser]) {
     try { enterApp(); } catch (e) {
       console.error(e);
       document.getElementById('login-screen')?.classList.remove('hidden');
     }
+  } else if (restored) {
+    currentUser = null; // team no longer exists
+    clearSession();
   }
 
 
@@ -6656,6 +6711,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('nsn-div-count')?.addEventListener('change', renderNewSeasonDivisionForm);
   document.getElementById('season-lineup-save')?.addEventListener('click', saveSeasonLineup);
   document.getElementById('season-add-btn')?.addEventListener('click', addLeagueTeam);
+  document.getElementById('reset-pin-btn')?.addEventListener('click', commishResetPin);
   document.getElementById('flip-coin')?.addEventListener('click', flipCoin);
   document.getElementById('process-waivers')?.addEventListener('click', processWaivers);
   document.getElementById('set-waiver-deadline')?.addEventListener('click', setWaiverDeadlineUI);
@@ -7288,19 +7344,21 @@ window.tryLogin = async function() {
       showErr('Database client not ready. Hard refresh and try again.');
       return;
     }
-    if (!data.users || !Object.keys(data.users).length) {
-      await loadAllData();
-    }
-    if (!data.users['doublej']) {
-      data.users['doublej'] = { name: 'Double J', division: null, isCommissioner: false, readOnly: true, maxRoster: 0, roster: [], lastDelta: null };
-    }
-    const res = login(pin);
+    const res = await loginWithPin(pin);
     if (!res.ok) {
-      showErr(res.error || 'PIN not found');
+      showErr(res.error || 'Wrong PIN.');
       return;
     }
+    if (input) input.value = '';
+    if (err) err.classList.add('hidden');
     await loadAllData();
+    if (!data.users[currentUser]) {
+      currentUser = null; clearSession();
+      showErr('Your team could not be loaded. Try again.');
+      return;
+    }
     enterApp();
+    if (res.pinIsTeamId) setTimeout(nudgePinChange, 400);
   } catch (e) {
     console.error('tryLogin', e);
     showErr('Login failed: ' + (e.message || e));

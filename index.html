@@ -29,7 +29,7 @@
     <div class="w-full max-w-md">
       <div class="text-center mb-8">
         <img src="aew-logo.png" alt="AEW Fantasy" class="mx-auto w-72 max-w-full mb-3 bg-transparent" />
-        <p class="text-gray-400 mt-1">Season 9</p>
+        <p class="text-gray-400 mt-1" data-season-name>Season 9</p>
       </div>
       
       <div class="bg-black/80 rounded-2xl p-6 border border-gray-900">
@@ -68,7 +68,7 @@
       <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
         <div class="flex items-center gap-2">
           <img src="aew-logo.png" alt="AEW Fantasy" class="h-16 sm:h-20 w-auto" />
-          <span class="text-xs text-gray-500 ml-1">S9</span>
+          <span class="text-xs text-gray-500 ml-1" data-season-short>S9</span>
         </div>
         <div class="flex items-center gap-3">
           <span id="user-badge" class="text-sm font-medium px-3 py-1 rounded-full bg-gray-800"></span>
@@ -466,7 +466,7 @@
 
         <div class="bg-aew-card rounded-xl border border-emerald-700/60 p-4 mt-6">
           <h3 class="font-bold mb-1 text-emerald-400">Start New Season</h3>
-          <p class="text-xs text-gray-500 mb-3">Order: <strong class="text-gray-300">1. Start New Season</strong> (divisions, AEW roster and roster spots below) → <strong class="text-gray-300">2. Season Lineup</strong> (who plays, which division) → <strong class="text-gray-300">3. Season Dates</strong> → <strong class="text-gray-300">4. Draft</strong> tab: schedule, run the Draft Fight, lock the order, Start Draft. Un-purges everyone, zeroes team points, roster size back to 8, clears last season’s finished drafts, removes held Foreign Objects, cancels open trades, clears waiver claims and the waiver deadline. Rosters are left alone (the draft replaces them).</p>
+          <p class="text-xs text-gray-500 mb-3">Order: <strong class="text-gray-300">1. Start New Season</strong> (divisions, AEW roster and roster spots below) → <strong class="text-gray-300">2. Season Lineup</strong> (who plays, which division) → <strong class="text-gray-300">3. Season Dates</strong> → <strong class="text-gray-300">4. Draft</strong> tab: schedule, run the Draft Fight, lock the order, Start Draft. Saves the ending season&apos;s champion to Past Champions and switches to the new season name. Un-purges everyone, zeroes team points, sets every roster to the spots you choose, clears last season’s finished drafts, removes held Foreign Objects, cancels open trades, clears waiver claims and the waiver deadline. Rosters are left alone (the draft replaces them).</p>
           <div class="mb-3">
             <label class="block text-xs text-gray-400 mb-1">1. How many divisions this season?</label>
             <select id="nsn-div-count" class="bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm mb-2">
@@ -490,7 +490,19 @@
             <label for="nsn-roster-spots" class="block text-xs text-gray-400 mb-1">3. Roster spots per team (required — this is also the number of draft rounds)</label>
             <input id="nsn-roster-spots" type="number" min="1" max="30" step="1" inputmode="numeric" placeholder="e.g. 8" class="w-32 bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-white" />
           </div>
-          <button type="button" id="start-new-season-btn" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-5 py-2 rounded-lg text-sm">4. Start New Season</button>
+          <div class="mb-3">
+            <label for="nsn-champion" class="block text-xs text-gray-400 mb-1">4. Champion of <span data-season-name>Season 9</span> (saved to Past Champions before standings are wiped)</label>
+            <div class="flex flex-wrap gap-2 items-center">
+              <select id="nsn-champion" class="bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm"></select>
+              <input id="nsn-champion-display" type="text" maxlength="60" placeholder="Name shown in Past Champions" class="flex-1 min-w-[10rem] bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-white" />
+            </div>
+            <p id="nsn-champion-hint" class="text-xs text-gray-500 mt-1"></p>
+          </div>
+          <div class="mb-3">
+            <label for="nsn-season-name" class="block text-xs text-gray-400 mb-1">5. New season name (shown in the title; edit it if you want a custom name)</label>
+            <input id="nsn-season-name" type="text" maxlength="40" class="w-64 max-w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-white" />
+          </div>
+          <button type="button" id="start-new-season-btn" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-5 py-2 rounded-lg text-sm">6. Start New Season</button>
         </div>
 
         <div class="bg-aew-card rounded-xl border border-aew-gold/40 p-4 mt-6">
@@ -826,6 +838,25 @@
             <button id="fantasy-champ-save" class="bg-aew-gold text-black font-bold px-4 py-2 rounded-lg text-sm">Set Champion</button>
           </div>
           <p id="fantasy-champ-msg" class="text-sm mt-2"></p>
+        </div>
+
+        <!-- Season Name + Past Champions -->
+        <div class="bg-aew-card rounded-xl border border-aew-gold/40 p-4 mt-4">
+          <h3 class="font-bold mb-1 text-aew-gold">Season Name</h3>
+          <p class="text-xs text-gray-500 mb-3">Shown in the page title and header. Start New Season asks for the next one.</p>
+          <div class="flex flex-wrap gap-2 items-center">
+            <input id="season-name-input" type="text" maxlength="40" class="w-64 max-w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-white" />
+            <button type="button" id="season-name-save" class="bg-aew-gold text-black font-bold px-4 py-2 rounded-lg text-sm">Save Season Name</button>
+          </div>
+          <p id="season-name-msg" class="text-sm mt-2"></p>
+          <h3 class="font-bold mt-5 mb-1 text-aew-gold">Past Champions</h3>
+          <p class="text-xs text-gray-500 mb-3">Start New Season adds the ending season automatically. Fix or add entries here. Season # sets the order; leave Season name blank to show &quot;Season #&quot;.</p>
+          <div id="past-champs-editor" class="space-y-2"></div>
+          <div class="flex flex-wrap gap-2 mt-3">
+            <button type="button" id="past-champs-add" class="bg-gray-700 hover:bg-gray-600 font-bold px-4 py-2 rounded-lg text-sm">Add Entry</button>
+            <button type="button" id="past-champs-save" class="bg-aew-gold text-black font-bold px-4 py-2 rounded-lg text-sm">Save Past Champions</button>
+          </div>
+          <p id="past-champs-msg" class="text-sm mt-2"></p>
         </div>
 
         <!-- Edit Team Rosters (failsafe) -->

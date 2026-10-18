@@ -1,5 +1,5 @@
 // =====================================================
-// AEW Fantasy League – Season 9 (Supabase live version)
+// AEW Fantasy League (Supabase live version). Season name comes from settings.season_name.
 // =====================================================
 
 const FO_TYPES = {
@@ -760,6 +760,42 @@ async function startNewSeason() {
   const spotsRaw = (document.getElementById('nsn-roster-spots')?.value || '').trim();
   const spots = parseRosterSpots(spotsRaw);
   if (!spots) return alert('Enter how many roster spots each team gets (a whole number from 1 to ' + MAX_ROSTER_SPOTS + '). It is also the number of draft rounds.');
+
+  // Step 4: champion of the season that is ending. Step 5: the new season's name.
+  const outgoingName = getSeasonName();
+  const champPin = document.getElementById('nsn-champion')?.value || '';
+  if (!champPin) return alert('Choose the champion of ' + outgoingName + ' (step 4), or pick "Don\u2019t record a champion".');
+  const newSeasonName = cleanSeasonName(document.getElementById('nsn-season-name')?.value);
+  if (!newSeasonName) return alert('Enter the new season\u2019s name (step 5), for example "' + suggestNextSeasonName(outgoingName, 0) + '".');
+  if (newSeasonName.toLowerCase() === outgoingName.toLowerCase()) return alert('The new season name is the same as the current one (' + outgoingName + '). Enter the next season\u2019s name in step 5.');
+  const fresh = await fetchPastChampionsFresh();
+  if (fresh.error) return alert('Could not read Past Champions: ' + fresh.error + '\nNothing was changed.');
+  const anyTeamPoints = teams.some(([pin]) => Number((data.points || {})[pin]));
+  let champEntry = null;
+  let champLine;
+  let newPastChampions = null;
+  if (champPin === '__none') {
+    champLine = `\u2022 No champion is recorded for ${outgoingName}\n`;
+  } else {
+    const cu = data.users[champPin];
+    if (!cu) return alert('That champion team no longer exists. Choose again in step 4.');
+    const shown = String(document.getElementById('nsn-champion-display')?.value || '').replace(/\s+/g, ' ').trim() || championDisplayName(cu);
+    const already = fresh.list.find(c => pastChampionLabel(c).toLowerCase() === outgoingName.toLowerCase());
+    if (already) {
+      champLine = `\u2022 ${outgoingName} is already in Past Champions (${already.name}), so nothing is added\n`;
+    } else if (!anyTeamPoints) {
+      champLine = `\u2022 Team standings are already all 0 (season looks already reset), so no champion is recorded for ${outgoingName}\n`;
+    } else {
+      const num = outgoingSeasonNumber(outgoingName, fresh.list);
+      champEntry = normalizePastChampion({ season: num, name: shown, label: outgoingName });
+      if (!champEntry) return alert('Enter the champion\u2019s name to show in Past Champions (step 4).');
+      newPastChampions = fresh.list.concat([champEntry]).sort((a, b) => a.season - b.season);
+      const pts = Number((data.points || {})[champPin]) || 0;
+      const lead = seasonPointsLeader();
+      champLine = `\u2022 ${outgoingName} CHAMPION: ${champEntry.name} (${cu.name}, ${pts} pts) is saved to Past Champions and keeps the \ud83d\udc51 crown\n` +
+        (lead && lead.pin !== champPin ? `   \u26a0\ufe0f The points leader is ${lead.name} (${lead.pts} pts) \u2014 make sure the champion is right\n` : '');
+    }
+  }
   const divProblem = await ensureDivisionsAllowed(slugs);
   if (divProblem) return alert(divProblem);
   const moved = teams.filter(([, u]) => u.division && !slugs.includes(u.division));
@@ -779,6 +815,8 @@ async function startNewSeason() {
   const anyPoints = Object.values(data.wrestlerPoints || {}).some(v => Number(v));
 
   if (!confirm('Start a NEW SEASON?\n\n' +
+    champLine +
+    `\u2022 Season name: ${outgoingName} \u2192 ${newSeasonName}\n` +
     `• Divisions: ${setup.count === 1 ? '1 (Overall only)' : setup.names.map(n => n.name).join(', ')}\n` +
     `• AEW roster: ${rosterMode === 'shared' ? 'ONE shared roster \u2014 each wrestler can be on only one team in the whole league' : 'each division gets its own full AEW roster'}\n` +
     (moved.length ? `• ${setup.count === 1 ? 'Moved into the one division' : 'Set to Not playing (their division is gone)'}: ${moved.map(([, u]) => u.name).join(', ')}\n` : '') +
@@ -792,16 +830,29 @@ async function startNewSeason() {
     '• All held Foreign Objects are removed, plus armed FO effects and the last Wheel Of Boom spin\n' +
     '• Open trade offers are cancelled (finished trade history stays)\n' +
     '• All waiver claims are cleared and the waiver deadline is removed\n\n' +
-    'Record the Fantasy League Champion first — final standings points are wiped.\n' +
     'Rosters are NOT touched (the draft overwrites them). Next: set teams below, then schedule the draft and run the Draft Fight.' + poolWarn)) return;
 
   const sb = window.supabaseClient;
   const problems = [];
-  // Save divisions + roster mode + roster spots first (key-value settings, no schema change)
-  for (const row of [{ key: 'division_setup', value: JSON.stringify(setup) }, { key: 'roster_mode', value: rosterMode }, { key: 'roster_spots', value: String(spots) }]) {
-    const { error: sErr } = await sb.from('settings').upsert(row);
-    if (sErr) return alert('Could not save ' + row.key + ': ' + sErr.message + '\nNothing else was changed.');
+  // Save the season settings first, BEFORE standings are wiped: the ending season's
+  // champion (Past Champions), the new season name, divisions, roster mode and roster
+  // spots. One upsert statement = all saved or none.
+  const settingRows = [
+    { key: 'division_setup', value: JSON.stringify(setup) },
+    { key: 'roster_mode', value: rosterMode },
+    { key: 'roster_spots', value: String(spots) },
+    { key: 'season_name', value: newSeasonName }
+  ];
+  if (newPastChampions) {
+    settingRows.push({ key: 'past_champions', value: JSON.stringify(newPastChampions) });
+    settingRows.push({ key: 'fantasy_champion', value: champPin });
   }
+  const { error: sErr } = await sb.from('settings').upsert(settingRows);
+  if (sErr) return alert('Could not save the season settings: ' + sErr.message + '\nNothing was changed.');
+  data.seasonName = newSeasonName;
+  if (newPastChampions) { data.pastChampions = newPastChampions; data.fantasyChampion = champPin; }
+  try { applySeasonNameToPage(); } catch (e) {}
+  ['nsn-season-name', 'nsn-champion', 'nsn-champion-display'].forEach(id => { const el = document.getElementById(id); if (el && el.dataset) delete el.dataset.dirty; });
   data.divisionSetup = setup;
   data.rosterMode = rosterMode;
   data.rosterSpots = spots;
@@ -847,7 +898,10 @@ async function startNewSeason() {
   await loadAllData();
   renderCommissioner();
   try { renderStandings(); } catch (e) {}
-  alert('New season started. Now set who is playing and their divisions under Season Lineup, then schedule the draft.' +
+  try { renderPastChampions(); renderPastChampionsEditor(true); } catch (e) {}
+  alert((champEntry ? outgoingName + ' champion ' + champEntry.name + ' saved to Past Champions.\n' : '') +
+    'Welcome to ' + newSeasonName + '. ' +
+    'New season started. Now set who is playing and their divisions under Season Lineup, then schedule the draft.' +
     (problems.length ? '\n\nSome items could not be cleared:\n' + problems.join('\n') : ''));
 }
 
@@ -1514,6 +1568,12 @@ async function loadAllData() {
     document.querySelectorAll('[data-roster-spots]').forEach(el => { el.textContent = String(getSeasonRosterSpots()); });
     document.querySelectorAll('[data-roster-spots-bonus]').forEach(el => { el.textContent = String(getSeasonRosterSpots() + 1); });
   } catch (e) {}
+  const seasonNameRow = (settings || []).find(s => s.key === 'season_name');
+  data.seasonName = seasonNameRow ? (cleanSeasonName(seasonNameRow.value) || null) : null;
+  const pastChampRow = (settings || []).find(s => s.key === 'past_champions');
+  data.pastChampions = pastChampRow ? parsePastChampions(pastChampRow.value) : null;
+  if (pastChampRow && !data.pastChampions) console.warn('past_champions setting could not be read; showing the built-in list');
+  try { applySeasonNameToPage(); } catch (e) {}
   data.divisionSetup = null;
   const divRow = (settings || []).find(s => s.key === 'division_setup');
   if (divRow && divRow.value) {
@@ -2496,6 +2556,8 @@ function renderCommissioner() {
   try { fillDivisionSetupForm(); } catch (e) {}
   try { renderSeasonLineup(); } catch (e) { console.warn(e); }
   try { fillNewSeasonForm(); } catch (e) { console.warn(e); }
+  try { fillNewSeasonChampionAndName(); } catch (e) { console.warn(e); }
+  try { wirePastChampionsEditor(); fillSeasonNameEditor(); renderPastChampionsEditor(); } catch (e) { console.warn(e); }
   try {
     const wr = document.getElementById('wheel-region');
     if (wr) { const cur = wr.value; wr.innerHTML = getLeagueDivisions().map(d => `<option value="${d}">${divisionLabel(d)}</option>`).join(''); if (cur) wr.value = cur; }
@@ -5831,11 +5893,20 @@ async function saveFantasyChampion() {
   renderStandings();
   renderLeagueRosters();
   renderPastChampions();
+  try { fillNewSeasonChampionAndName(); } catch (e) {}
 }
 
 
 
-const PAST_CHAMPIONS = [
+// ---------------------------------------------------------------------------
+// Season name + Past Champions (settings rows 'season_name' and 'past_champions').
+// The defaults below are only used while those rows don't exist yet, so the site
+// looks the same before and after the seed. Entry format is unchanged:
+// { season: <number, sets the order>, name: <champion as shown> } plus an optional
+// label for a custom season name (no label = shown as "Season <number>").
+// ---------------------------------------------------------------------------
+const DEFAULT_SEASON_NAME = 'Season 9';
+const DEFAULT_PAST_CHAMPIONS = [
   { season: 1, name: 'Devin' },
   { season: 2, name: 'Gally' },
   { season: 3, name: 'Stess' },
@@ -5845,32 +5916,287 @@ const PAST_CHAMPIONS = [
   { season: 7, name: 'Bito and Boti tag team' },
   { season: 8, name: 'Josh' },
 ];
+const SEASON_NAME_MAX = 40;
+const CHAMPION_NAME_MAX = 60;
+
+function escHtml(v) {
+  return String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function cleanSeasonName(v) {
+  return String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, SEASON_NAME_MAX);
+}
+function getSeasonName() {
+  return cleanSeasonName(data.seasonName) || DEFAULT_SEASON_NAME;
+}
+function seasonShortName(name) {
+  const m = /^season\s+(\d+)$/i.exec(name || '');
+  return m ? 'S' + m[1] : name;
+}
+function defaultSeasonLabel(n) { return 'Season ' + n; }
+function pastChampionLabel(c) { return (c && c.label) || defaultSeasonLabel(c.season); }
+
+// Normalise one entry. Returns null when it is unusable.
+function normalizePastChampion(c) {
+  if (!c || typeof c !== 'object') return null;
+  const season = Number(c.season);
+  const name = String(c.name == null ? '' : c.name).replace(/\s+/g, ' ').trim().slice(0, CHAMPION_NAME_MAX);
+  if (!Number.isInteger(season) || season < 1 || season > 999 || !name) return null;
+  const out = { season, name };
+  const label = cleanSeasonName(c.label);
+  if (label && label.toLowerCase() !== defaultSeasonLabel(season).toLowerCase()) out.label = label;
+  return out;
+}
+function parsePastChampions(raw) {
+  let arr;
+  try { arr = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) { return null; }
+  if (!Array.isArray(arr)) return null;
+  return arr.map(normalizePastChampion).filter(Boolean).sort((a, b) => a.season - b.season);
+}
+function getPastChampions() {
+  return Array.isArray(data.pastChampions) ? data.pastChampions.slice() : DEFAULT_PAST_CHAMPIONS.map(c => ({ ...c }));
+}
+// The season number for the season that is ending: "Season 9" -> 9, a custom name
+// -> one after the highest recorded season.
+function outgoingSeasonNumber(name, list) {
+  const m = /^season\s+(\d+)$/i.exec(name || '');
+  const maxSeason = Math.max(0, ...(list || []).map(c => c.season));
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (n >= 1 && n <= 999 && !(list || []).some(c => c.season === n)) return n;
+  }
+  return maxSeason + 1;
+}
+// "Season 9" -> "Season 10", "Summer 2026" -> "Summer 2027", no number -> "Season <n+1>".
+function suggestNextSeasonName(cur, outgoingNumber) {
+  const m = /^(.*?)(\d+)(\D*)$/.exec(cur || '');
+  if (m) return cleanSeasonName(m[1] + (parseInt(m[2], 10) + 1) + m[3]);
+  return defaultSeasonLabel((outgoingNumber || 0) + 1);
+}
+// "JOSH" -> "Josh"; mixed-case names are kept as typed.
+function championDisplayName(u) {
+  const n = String((u && u.name) || '').trim();
+  if (n && n === n.toUpperCase() && /[A-Z]/.test(n)) return n.toLowerCase().replace(/(^|[\s\-'])([a-z])/g, (_, a, b) => a + b.toUpperCase());
+  return n;
+}
+
+function applySeasonNameToPage() {
+  const n = getSeasonName();
+  if (typeof document === 'undefined') return;
+  if (window.__aewTitleBase == null) {
+    const t = document.title || '';
+    window.__aewTitleBase = t.endsWith(DEFAULT_SEASON_NAME) ? t.slice(0, t.length - DEFAULT_SEASON_NAME.length) : 'AEW Fantasy League \u2013 ';
+  }
+  document.title = window.__aewTitleBase + n;
+  document.querySelectorAll('[data-season-name]').forEach(el => { el.textContent = n; });
+  document.querySelectorAll('[data-season-short]').forEach(el => {
+    el.textContent = seasonShortName(n);
+  });
+}
 
 function renderPastChampions() {
   const el = document.getElementById('past-champions-list');
   if (!el) return;
+  const list = getPastChampions();
+  if (!list.length) {
+    el.innerHTML = '<p class="px-4 py-3 text-gray-500 text-sm">No past champions recorded yet.</p>';
+    return;
+  }
 
-  // Latest past champion in the list is S8 Josh — crown only if they are also the active fantasy champion
+  // Crown on the most recent entry only if that person is also the active fantasy champion
   const currentPin = data.fantasyChampion;
   const currentName = currentPin ? (data.users[currentPin]?.name || '') : '';
+  const latestSeason = Math.max(...list.map(x => x.season));
 
-  el.innerHTML = PAST_CHAMPIONS.slice().reverse().map((c, idx) => {
-    // Only show crown on the most recent season entry if that person is the active champion
-    const isLatest = c.season === Math.max(...PAST_CHAMPIONS.map(x => x.season));
+  el.innerHTML = list.slice().reverse().map((c) => {
+    const isLatest = c.season === latestSeason;
     const showCrown = isLatest && currentName && currentName.toLowerCase() === c.name.toLowerCase();
     // Also match if champion name is Josh and entry is Josh
     const showCrown2 = isLatest && currentPin && (data.users[currentPin]?.name || '').toLowerCase().includes('josh') && c.name.toLowerCase() === 'josh';
     const crown = (showCrown || showCrown2) ? ' 👑' : '';
+    const labelCls = c.label ? 'text-gray-500 text-sm min-w-[4rem]' : 'text-gray-500 text-sm w-16';
     return `
       <div class="flex items-center justify-between px-4 py-3 ${isLatest ? 'bg-aew-gold/5' : ''}">
         <div class="flex items-center gap-3">
-          <span class="text-gray-500 text-sm w-16">Season ${c.season}</span>
-          <span class="font-semibold ${isLatest ? 'text-aew-gold' : ''}">${c.name}${crown}</span>
+          <span class="${labelCls}">${escHtml(pastChampionLabel(c))}</span>
+          <span class="font-semibold ${isLatest ? 'text-aew-gold' : ''}">${escHtml(c.name)}${crown}</span>
         </div>
         ${isLatest ? '<span class="text-xs text-aew-gold">Current</span>' : ''}
       </div>
     `;
   }).join('');
+}
+
+// ---- Commissioner: season name + past champions editor ----
+function fillSeasonNameEditor() {
+  const inp = document.getElementById('season-name-input');
+  if (inp && !inp.dataset.dirty && document.activeElement !== inp) inp.value = getSeasonName();
+}
+
+async function saveSeasonName() {
+  if (guardReadOnly('change the season name')) return;
+  if (!isCommissioner()) return alert('Only the commissioner can change the season name.');
+  const inp = document.getElementById('season-name-input');
+  const msg = document.getElementById('season-name-msg');
+  const name = cleanSeasonName(inp?.value);
+  if (!name) return alert('Enter a season name (for example "' + DEFAULT_SEASON_NAME + '").');
+  const { error } = await window.supabaseClient.from('settings').upsert({ key: 'season_name', value: name });
+  if (error) { if (msg) { msg.textContent = 'Could not save: ' + error.message; msg.className = 'text-sm mt-2 text-red-400'; } return; }
+  data.seasonName = name;
+  if (inp) { inp.value = name; delete inp.dataset.dirty; }
+  applySeasonNameToPage();
+  if (msg) { msg.textContent = 'Season name saved: ' + name; msg.className = 'text-sm mt-2 text-emerald-400'; }
+}
+
+function pastChampRowHtml(c) {
+  const season = c && c.season != null ? c.season : '';
+  return `<div class="past-champ-row flex flex-wrap gap-2 items-center">
+    <input type="number" min="1" max="999" step="1" class="pc-season w-20 bg-black border border-gray-700 rounded-lg px-2 py-1.5 text-sm text-white" placeholder="#" value="${escHtml(season)}" />
+    <input type="text" maxlength="${SEASON_NAME_MAX}" class="pc-label w-40 bg-black border border-gray-700 rounded-lg px-2 py-1.5 text-sm text-white" placeholder="${escHtml(season ? defaultSeasonLabel(season) : 'Season name')}" value="${escHtml((c && c.label) || '')}" />
+    <input type="text" maxlength="${CHAMPION_NAME_MAX}" class="pc-name flex-1 min-w-[8rem] bg-black border border-gray-700 rounded-lg px-2 py-1.5 text-sm text-white" placeholder="Champion" value="${escHtml((c && c.name) || '')}" />
+    <button type="button" class="pc-remove text-xs text-red-400 hover:text-red-300 px-2" title="Remove entry">Remove</button>
+  </div>`;
+}
+
+function renderPastChampionsEditor(force) {
+  const el = document.getElementById('past-champs-editor');
+  if (!el) return;
+  if (el.dataset.dirty && !force) return; // don't wipe unsaved edits on refresh
+  el.innerHTML = getPastChampions().slice().reverse().map(pastChampRowHtml).join('') ||
+    '<p class="text-gray-500 text-sm pc-empty">No entries yet.</p>';
+  delete el.dataset.dirty;
+}
+
+function wirePastChampionsEditor() {
+  const el = document.getElementById('past-champs-editor');
+  if (!el || el.dataset.wired) return;
+  el.dataset.wired = '1';
+  el.addEventListener('input', () => { el.dataset.dirty = '1'; });
+  el.addEventListener('click', (e) => {
+    const b = e.target.closest('.pc-remove');
+    if (!b) return;
+    b.closest('.past-champ-row')?.remove();
+    el.dataset.dirty = '1';
+  });
+  document.getElementById('past-champs-add')?.addEventListener('click', () => {
+    el.querySelector('.pc-empty')?.remove();
+    const next = Math.max(0, ...[...el.querySelectorAll('.pc-season')].map(i => parseInt(i.value, 10) || 0)) + 1;
+    el.insertAdjacentHTML('afterbegin', pastChampRowHtml({ season: next, name: '' }));
+    el.dataset.dirty = '1';
+  });
+  document.getElementById('past-champs-save')?.addEventListener('click', savePastChampionsFromEditor);
+  const sn = document.getElementById('season-name-input');
+  sn?.addEventListener('input', () => { sn.dataset.dirty = '1'; });
+  document.getElementById('season-name-save')?.addEventListener('click', saveSeasonName);
+}
+
+// Reads the editor rows. Returns { list } or { error }.
+function readPastChampionsEditor() {
+  const el = document.getElementById('past-champs-editor');
+  const rows = el ? [...el.querySelectorAll('.past-champ-row')] : [];
+  const list = [];
+  const seen = new Set();
+  for (const r of rows) {
+    const seasonRaw = (r.querySelector('.pc-season')?.value || '').trim();
+    const label = r.querySelector('.pc-label')?.value || '';
+    const name = r.querySelector('.pc-name')?.value || '';
+    if (!seasonRaw && !label.trim() && !name.trim()) continue; // empty row
+    const season = Number(seasonRaw);
+    if (!/^\d+$/.test(seasonRaw) || season < 1 || season > 999) return { error: 'Every entry needs a season # (a whole number from 1 to 999).' };
+    if (!name.trim()) return { error: 'Season #' + season + ' needs a champion name (or remove the entry).' };
+    if (seen.has(season)) return { error: 'Season #' + season + ' is listed twice. Each season # can be used once.' };
+    seen.add(season);
+    list.push(normalizePastChampion({ season, name, label }));
+  }
+  list.sort((a, b) => a.season - b.season);
+  return { list };
+}
+
+async function savePastChampionsFromEditor() {
+  if (guardReadOnly('edit past champions')) return;
+  if (!isCommissioner()) return alert('Only the commissioner can edit past champions.');
+  const msg = document.getElementById('past-champs-msg');
+  const res = readPastChampionsEditor();
+  if (res.error) return alert(res.error);
+  const before = getPastChampions();
+  const removed = before.filter(b => !res.list.some(c => c.season === b.season));
+  if (removed.length && !confirm('Remove ' + removed.map(c => pastChampionLabel(c) + ' (' + c.name + ')').join(', ') + ' from Past Champions?')) return;
+  const { error } = await window.supabaseClient.from('settings').upsert({ key: 'past_champions', value: JSON.stringify(res.list) });
+  if (error) { if (msg) { msg.textContent = 'Could not save: ' + error.message; msg.className = 'text-sm mt-2 text-red-400'; } return; }
+  data.pastChampions = res.list;
+  renderPastChampionsEditor(true);
+  renderPastChampions();
+  if (msg) { msg.textContent = 'Past Champions saved (' + res.list.length + ' entries).'; msg.className = 'text-sm mt-2 text-emerald-400'; }
+}
+
+// ---- Start New Season: champion of the ending season + next season name ----
+function seasonPointsLeader() {
+  let best = null;
+  Object.entries(data.users || {}).forEach(([pin, u]) => {
+    if (!u || u.readOnly || !u.division || u.purged) return;
+    const pts = Number((data.points || {})[pin]) || 0;
+    if (!best || pts > best.pts) best = { pin, name: u.name, pts };
+  });
+  return best;
+}
+
+function updateNewSeasonChampionHint() {
+  const sel = document.getElementById('nsn-champion');
+  const hint = document.getElementById('nsn-champion-hint');
+  const disp = document.getElementById('nsn-champion-display');
+  if (!sel) return;
+  const pin = sel.value;
+  const u = pin && pin !== '__none' ? data.users[pin] : null;
+  if (disp) {
+    disp.disabled = !u;
+    if (!u) disp.value = '';
+    else if (!disp.dataset.dirty || disp.dataset.forPin !== pin) { disp.value = championDisplayName(u); disp.dataset.forPin = pin; delete disp.dataset.dirty; }
+  }
+  if (hint) {
+    const lead = seasonPointsLeader();
+    const parts = [];
+    if (lead) parts.push('Points leader right now: ' + lead.name + ' (' + lead.pts + ' pts).');
+    if (data.fantasyChampion && data.users[data.fantasyChampion]) parts.push('Fantasy League Champion setting: ' + data.users[data.fantasyChampion].name + '.');
+    hint.textContent = parts.join(' ');
+  }
+}
+
+function fillNewSeasonChampionAndName() {
+  const sel = document.getElementById('nsn-champion');
+  if (sel) {
+    const keep = sel.dataset.dirty ? sel.value : (data.fantasyChampion && data.users[data.fantasyChampion] ? data.fantasyChampion : '');
+    const teams = Object.entries(data.users || {})
+      .filter(([pin, u]) => pin !== 'doublej' && u && !u.readOnly)
+      .sort((a, b) => String(a[1].name).localeCompare(String(b[1].name)));
+    sel.innerHTML = '<option value="">Choose the champion\u2026</option>' +
+      teams.map(([pin, u]) => `<option value="${escHtml(pin)}">${escHtml(u.name)}</option>`).join('') +
+      '<option value="__none">Don\u2019t record a champion</option>';
+    sel.value = keep;
+    if (sel.value !== keep) sel.value = '';
+    if (!sel.dataset.wired) {
+      sel.dataset.wired = '1';
+      sel.addEventListener('change', () => { sel.dataset.dirty = '1'; updateNewSeasonChampionHint(); });
+      const disp = document.getElementById('nsn-champion-display');
+      disp?.addEventListener('input', () => { disp.dataset.dirty = '1'; });
+    }
+    updateNewSeasonChampionHint();
+  }
+  const nameInp = document.getElementById('nsn-season-name');
+  if (nameInp && !nameInp.dataset.dirty && document.activeElement !== nameInp) {
+    const cur = getSeasonName();
+    nameInp.value = suggestNextSeasonName(cur, outgoingSeasonNumber(cur, getPastChampions()));
+    if (!nameInp.dataset.wired) { nameInp.dataset.wired = '1'; nameInp.addEventListener('input', () => { nameInp.dataset.dirty = '1'; }); }
+  }
+}
+
+// Reads the current past_champions row straight from the database (falls back to
+// the defaults when the row doesn't exist yet). Returns { list } or { error }.
+async function fetchPastChampionsFresh() {
+  const { data: row, error } = await window.supabaseClient.from('settings').select('value').eq('key', 'past_champions').maybeSingle();
+  if (error) return { error: error.message };
+  if (!row) return { list: DEFAULT_PAST_CHAMPIONS.map(c => ({ ...c })) };
+  const list = parsePastChampions(row.value);
+  if (!list) return { error: 'The saved Past Champions list could not be read. Fix it in the Past Champions editor first.' };
+  return { list };
 }
 
 

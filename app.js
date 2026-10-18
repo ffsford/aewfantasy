@@ -4548,16 +4548,15 @@ async function setDraftSchedule() {
   if (st === 'active' || st === 'paused') {
     return alert(`${div.toUpperCase()} draft is ${st}. Finish it before scheduling a new one.`);
   }
+  // A locked order on a not-started draft is this season's Draft Fight result: keep it.
   const hasOrder = !!(existing?.order_locked || (existing?.order_pins || []).length);
-  const prevWhen = existing?.scheduled_at ? new Date(existing.scheduled_at).getTime() : NaN;
-  const oldOrder = hasOrder && (isNaN(prevWhen) || prevWhen < Date.now() - 24 * 60 * 60 * 1000);
-  const stale = !!existing && (st === 'complete' || (existing.current_pick || 0) > 0 || oldPicks.length > 0 || oldOrder);
+  const stale = !!existing && (st === 'complete' || (existing.current_pick || 0) > 0 || oldPicks.length > 0);
 
   if (stale) {
     if (oldPicks.length && !confirm(
       `Reset ${div.toUpperCase()} draft for the new date?\n\n` +
       `This deletes the previous draft's ${oldPicks.length} picks and clears its order. ` +
-      `A new random order is made 15 minutes before the new start. Team rosters are NOT changed.`
+      `Run a new Draft Fight to set the order. Team rosters are NOT changed.`
     )) return;
     // Only reset if it is still not running (another commissioner tab could have started it)
     const { data: reset, error } = await window.supabaseClient.from('drafts').update({
@@ -4582,8 +4581,8 @@ async function setDraftSchedule() {
   }
   const keptOrder = !stale && hasOrder;
   alert(`${div.toUpperCase()} draft scheduled for ${when.toLocaleString()}` +
-    (stale ? '\nPrevious draft cleared. New order randomizes 15 minutes before start.' : '') +
-    (keptOrder ? '\nDraft order was already locked and stays the same.' : ''));
+    (stale ? '\nPrevious draft cleared. Run a new Draft Fight to set and lock the order.' : '') +
+    (keptOrder ? '\nDraft order (from the Draft Fight) is already locked and stays the same.' : ''));
   updateDraftScheduleBanner();
   renderDraft();
 }

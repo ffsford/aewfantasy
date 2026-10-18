@@ -7327,7 +7327,23 @@ loadAllData = async function() {
 
 
 // ===== Emergency login (works even if DOMContentLoaded bootstrap glitches) =====
+// One login at a time: the button is disabled while a login is in flight, and
+// repeat clicks / Enter presses are ignored until it finishes.
+let loginInFlight = false;
 window.tryLogin = async function() {
+  if (loginInFlight) return;
+  loginInFlight = true;
+  const btn = document.getElementById('login-btn');
+  if (btn) btn.disabled = true;
+  try {
+    await runLoginAttempt();
+  } finally {
+    loginInFlight = false;
+    if (btn) btn.disabled = false;
+  }
+};
+
+async function runLoginAttempt() {
   const err = document.getElementById('login-error');
   const input = document.getElementById('pin-input');
   const pin = (input && input.value || '').trim().toLowerCase();
@@ -7363,8 +7379,9 @@ window.tryLogin = async function() {
     console.error('tryLogin', e);
     showErr('Login failed: ' + (e.message || e));
   }
-};
+}
 
+// The only click binding for the login button (index.html has no inline onclick).
 document.getElementById('login-btn')?.addEventListener('click', (e) => {
   e.preventDefault();
   window.tryLogin();

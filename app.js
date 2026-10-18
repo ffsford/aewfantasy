@@ -520,23 +520,22 @@ async function checkAndRunScheduledPurge() {
 
 async function executePurgeCore(opts = {}) {
   const auto = !!opts.auto;
-  const eastVictim = getLastPlacePin('east');
-  const westVictim = getLastPlacePin('west');
-  if (!eastVictim && !westVictim) {
+  const byDivVictim = getLeagueDivisions().map(d => ({ div: d, v: getLastPlacePin(d) })).filter(x => x.v);
+  const eastVictim = byDivVictim.find(x => x.div === 'east')?.v || null;
+  const westVictim = byDivVictim.find(x => x.div === 'west')?.v || null;
+  if (!byDivVictim.length) {
     if (!auto) alert('No teams to purge.');
     return { ok: false, victims: [] };
   }
 
   if (!auto) {
-    const lines = [];
-    if (eastVictim) lines.push('EAST: ' + eastVictim.name + ' (' + eastVictim.points + ' pts)');
-    if (westVictim) lines.push('WEST: ' + westVictim.name + ' (' + westVictim.points + ' pts)');
+    const lines = byDivVictim.map(x => divisionLabel(x.div).toUpperCase() + ': ' + x.v.name + ' (' + x.v.points + ' pts)');
     if (!confirm('PURGE these last-place teams?\n\n' + lines.join('\n') + '\n\nTheir rosters will go to free agency.')) {
       return { ok: false, victims: [] };
     }
   }
 
-  const victims = [eastVictim, westVictim].filter(Boolean);
+  const victims = byDivVictim.map(x => x.v);
   for (const v of victims) {
     const u = data.users[v.pin];
     await window.supabaseClient.from('teams').update({ roster: [], purged: true }).eq('pin', v.pin);
@@ -545,7 +544,7 @@ async function executePurgeCore(opts = {}) {
 
   try {
     for (const v of victims) {
-      const msg = 'RED ALERT: ' + v.name + ' has been PURGED from the league. Their roster is in free agency. Check the waiver deadline.';
+      const msg = 'RED ALERT: ' + v.name + ' has been PURGED from the league. Their roster is in free agency' + (isSharedRosterPool() ? ' for the whole league' : '') + '. Check the waiver deadline.';
       for (const [pin, u] of Object.entries(data.users)) {
         if (u.division && !u.readOnly) {
           await notifyTradeUpdate(pin, msg);
@@ -603,6 +602,273 @@ async function saveSeasonDates(start, end) {
   await window.supabaseClient.from('settings').upsert({ key: 'season_end', value: end || '' });
   data.seasonStart = start || null;
   data.seasonEnd = end || null;
+}
+
+// ---------- New season + season lineup (commissioner) ----------
+// A team "plays this season" when it has a division. Teams set to "Not playing"
+// get division = null (no schema change) — they drop out of standings, scoring,
+// the Purge and the draft, but keep their PIN and can be brought back later.
+
+// ----- AEW roster mode -----
+// 'separate' (default, original behavior): each division has its own full copy of
+// the AEW roster. 'shared': one AEW roster for the whole league — a wrestler can
+// be on only one team anywhere. One division is always shared.
+function isSharedRosterPool() {
+  if (isSingleDivision()) return true;
+  return data.rosterMode === 'shared';
+}
+
+/** Wrestlers already drafted that this division's draft must skip */
+async function loadDraftTaken(division, divisionPicks) {
+  const norm = (w) => String(w || '').toLowerCase().trim();
+  if (!isSharedRosterPool()) return new Set((divisionPicks || []).map(p => norm(p.wrestler)));
+  const { data: rows, error } = await window.supabaseClient.from('draft_picks').select('wrestler');
+  if (error) throw new Error('Could not load other divisions\u2019 picks: ' + error.message);
+  return new Set((rows || []).map(p => norm(p.wrestler)));
+}
+
+/** Division setup from a count + raw names (shared by the Divisions panel and Start New Season).
+ *  1 division and 2 divisions map onto the DB's existing slugs (east / west), so they
+ *  work without a migration. 3+ divisions need the division CHECK constraints relaxed. */
+function buildDivisionSetup(count, rawNames) {
+  count = Math.max(1, Math.min(8, parseInt(count, 10) || 1));
+  if (count === 1) return { setup: { count: 1, names: [{ slug: 'east', name: 'Overall' }] } };
+  const names = [];
+  for (let i = 0; i < count; i++) {
+    const raw = String((rawNames || [])[i] || '').trim();
+    if (!raw) return { error: 'Name every division.' };
+    let slug;
+    if (count === 2) slug = i === 0 ? 'east' : 'west';
+    else {
+      slug = raw.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || ('div' + (i + 1));
+      if (slug === 'east_coast') slug = 'east';
+      if (slug === 'west_coast') slug = 'west';
+      if (names.some(n => n.slug === slug)) slug = slug + '_' + (i + 1);
+    }
+    names.push({ slug, name: raw });
+  }
+  return { setup: { count, names } };
+}
+
+const DIVISION_MIGRATION_MSG = 'The database only allows the divisions East and West. ' +
+  'To use other divisions, apply the "divisions" migration from the Start New Season pull request first. Nothing was changed.';
+
+function isDivisionCheckError(err) {
+  return !!err && (err.code === '23514' || /division_check/i.test(String(err.message || '')));
+}
+
+/** Make sure a drafts row can exist for every division (also tells us if the DB allows the slug) */
+async function ensureDivisionsAllowed(slugs) {
+  const { data: rows, error } = await window.supabaseClient.from('drafts').select('division');
+  if (error) return 'Could not check divisions: ' + error.message;
+  const have = new Set((rows || []).map(r => r.division));
+  for (const slug of slugs) {
+    if (have.has(slug)) continue;
+    const { error: insErr } = await window.supabaseClient.from('drafts').insert({ division: slug, status: 'idle' });
+    if (insErr && isDivisionCheckError(insErr)) return DIVISION_MIGRATION_MSG;
+    if (insErr && insErr.code !== '23505') return 'Could not set up division ' + slug + ': ' + insErr.message;
+  }
+  return null;
+}
+
+function renderNewSeasonDivisionForm() {
+  const countEl = document.getElementById('nsn-div-count');
+  const box = document.getElementById('nsn-div-names');
+  const modeBox = document.getElementById('nsn-roster-mode-box');
+  if (!countEl || !box) return;
+  const count = parseInt(countEl.value, 10) || 1;
+  const existing = (getDivisionSetup().names || []).map(n => n.name);
+  const prev = [...box.querySelectorAll('input')].map(i => i.value);
+  box.innerHTML = count <= 1 ? '' : Array.from({ length: count }, (_, i) => {
+    const val = String(prev[i] ?? existing[i] ?? '').replace(/"/g, '&quot;');
+    return `<label class="block text-xs text-gray-400">Division ${i + 1} name
+      <input id="nsn-div-name-${i}" type="text" value="${val}" placeholder="e.g. East Coast" class="mt-1 w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-white" /></label>`;
+  }).join('');
+  if (modeBox) modeBox.classList.toggle('hidden', count <= 1);
+}
+
+function fillNewSeasonForm() {
+  const countEl = document.getElementById('nsn-div-count');
+  if (!countEl || countEl.dataset.filled) return;
+  countEl.dataset.filled = '1';
+  countEl.value = String(getDivisionSetup().count || 2);
+  const mode = data.rosterMode === 'shared' ? 'shared' : 'separate';
+  const radio = document.querySelector(`input[name="nsn-roster-mode"][value="${mode}"]`);
+  if (radio) radio.checked = true;
+  renderNewSeasonDivisionForm();
+}
+
+async function draftBlocksLineupChange() {
+  const { data: drafts, error } = await window.supabaseClient.from('drafts').select('division, status, order_locked, order_pins');
+  if (error) return 'Could not check draft status: ' + error.message;
+  const running = (drafts || []).find(d => d.status === 'active' || d.status === 'paused');
+  if (running) return `${String(running.division).toUpperCase()} draft is ${running.status}. Wait until it is complete.`;
+  return null;
+}
+
+async function startNewSeason() {
+  if (guardReadOnly('start a new season')) return;
+  if (!isCommissioner()) return alert('Only the commissioner can start a new season.');
+  const blocked = await draftBlocksLineupChange();
+  if (blocked) return alert(blocked);
+  const teams = Object.entries(data.users || {}).filter(([pin, u]) => pin !== 'doublej' && u && !u.readOnly);
+  const purged = teams.filter(([, u]) => u.purged).map(([, u]) => u.name);
+
+  // Step 1: divisions. Step 2: AEW roster mode (one division = always shared).
+  const divCount = parseInt(document.getElementById('nsn-div-count')?.value, 10) || 1;
+  const rawNames = Array.from({ length: divCount }, (_, i) => document.getElementById('nsn-div-name-' + i)?.value || '');
+  const built = buildDivisionSetup(divCount, rawNames);
+  if (built.error) return alert(built.error);
+  const setup = built.setup;
+  const slugs = setup.names.map(n => n.slug);
+  let rosterMode = 'shared';
+  if (setup.count > 1) {
+    rosterMode = document.querySelector('input[name="nsn-roster-mode"]:checked')?.value || '';
+    if (rosterMode !== 'shared' && rosterMode !== 'separate') return alert('Choose the AEW roster: one shared roster, or each division gets its own.');
+  }
+  const divProblem = await ensureDivisionsAllowed(slugs);
+  if (divProblem) return alert(divProblem);
+  const moved = teams.filter(([, u]) => u.division && !slugs.includes(u.division));
+
+  if (!confirm('Start a NEW SEASON?\n\n' +
+    `• Divisions: ${setup.count === 1 ? '1 (Overall only)' : setup.names.map(n => n.name).join(', ')}\n` +
+    `• AEW roster: ${rosterMode === 'shared' ? 'ONE shared roster \u2014 each wrestler can be on only one team in the whole league' : 'each division gets its own full AEW roster'}\n` +
+    (moved.length ? `• ${setup.count === 1 ? 'Moved into the one division' : 'Set to Not playing (their division is gone)'}: ${moved.map(([, u]) => u.name).join(', ')}\n` : '') +
+    `• Un-purge every team${purged.length ? ' (' + purged.join(', ') + ')' : ''}\n` +
+    '• Team standings points and last-show change go to 0\n' +
+    '• Roster size goes back to 8 (Foreign Object 9th spot ends)\n' +
+    '• Last season\u2019s finished drafts are cleared (picks, order, lock) so a new Draft Fight can run\n' +
+    '• All held Foreign Objects are removed, plus armed FO effects and the last Wheel Of Boom spin\n' +
+    '• Open trade offers are cancelled (finished trade history stays)\n' +
+    '• All waiver claims are cleared and the waiver deadline is removed\n\n' +
+    'Record the Fantasy League Champion first — final standings points are wiped.\n' +
+    'Rosters are NOT touched (the draft overwrites them). Next: set teams below, then schedule the draft and run the Draft Fight.')) return;
+
+  const sb = window.supabaseClient;
+  // Save divisions + roster mode first (key-value settings, no schema change)
+  for (const row of [{ key: 'division_setup', value: JSON.stringify(setup) }, { key: 'roster_mode', value: rosterMode }]) {
+    const { error: sErr } = await sb.from('settings').upsert(row);
+    if (sErr) return alert('Could not save ' + row.key + ': ' + sErr.message + '\nNothing else was changed.');
+  }
+  data.divisionSetup = setup;
+  data.rosterMode = rosterMode;
+  for (const [pin] of moved) {
+    const { error: mErr } = await sb.from('teams').update({ division: setup.count === 1 ? slugs[0] : null }).eq('pin', pin);
+    if (mErr) return alert(isDivisionCheckError(mErr) ? DIVISION_MIGRATION_MSG : 'Could not move team: ' + mErr.message);
+  }
+
+  const { error } = await sb.from('teams')
+    .update({ purged: false, points: 0, last_delta: null, max_roster: 8 })
+    .neq('pin', ''); // all teams
+  if (error) return alert('Could not reset teams: ' + error.message);
+
+  // Season-level FO / trade / waiver state. History (fo_history, finished trades,
+  // waiver_reports) stays. Autopick lists, trade blocks and the Purge date stay.
+  const problems = [];
+  const step = async (label, q) => { const { error: e } = await q; if (e) problems.push(label + ': ' + e.message); };
+  await step('Foreign Objects', sb.from('foreign_objects').delete().gt('id', 0));
+  await step('armed FO effects', sb.from('settings').delete().in('key', ['ppv_week_pin', 'waiver_disrupter_pin']));
+  await step('Waiver Disrupter flags', sb.from('settings').delete().like('key', 'waiver_disrupter_%'));
+  await step('Wheel Of Boom spin', sb.from('settings').delete().eq('key', 'wheel_live_spin'));
+  await step('open trades', sb.from('trades').update({ status: 'cancelled', resolved_at: new Date().toISOString() })
+    .in('status', ['pending', 'accepted_by_player', 'accepted']));
+  await step('waiver claims', sb.from('claims').delete().neq('pin', ''));
+  await step('waiver claim drops', sb.from('settings').delete().like('key', 'claim_drops_%'));
+  await step('waiver deadline', sb.from('settings').delete().in('key', ['waiver_deadline', 'last_processed_deadline']));
+
+  // Clear finished/stale drafts, but never one that is running (conditional on status)
+  const { data: drafts } = await sb.from('drafts').select('division, status, current_pick');
+  for (const d of drafts || []) {
+    const { data: reset } = await sb.from('drafts').update({
+      status: 'idle', order_pins: [], order_locked: false, current_pick: 0,
+      started_at: null, scheduled_at: null, updated_at: new Date().toISOString()
+    }).eq('division', d.division).or('status.is.null,status.in.(idle,complete)').select('division');
+    if (reset && reset.length) await sb.from('draft_picks').delete().eq('division', d.division);
+  }
+  await loadAllData();
+  renderCommissioner();
+  try { renderStandings(); } catch (e) {}
+  alert('New season started. Now set who is playing and their divisions under Season Lineup, then schedule the draft.' +
+    (problems.length ? '\n\nSome items could not be cleared:\n' + problems.join('\n') : ''));
+}
+
+function renderSeasonLineup() {
+  const el = document.getElementById('season-lineup-list');
+  if (!el) return;
+  const divs = getLeagueDivisions();
+  const opts = (cur) => divs.map(d => `<option value="${d}" ${cur === d ? 'selected' : ''}>${divisionLabel(d)}</option>`).join('') +
+    `<option value="" ${!cur ? 'selected' : ''}>Not playing this season</option>`;
+  const teams = Object.entries(data.users || {})
+    .filter(([pin, u]) => pin !== 'doublej' && u && !u.readOnly)
+    .sort((a, b) => String(a[1].division || 'zzz').localeCompare(String(b[1].division || 'zzz')) || String(a[1].name).localeCompare(String(b[1].name)));
+  el.innerHTML = teams.map(([pin, u]) => `
+    <div class="flex flex-wrap items-center gap-2 bg-black/40 rounded-lg px-3 py-2">
+      <span class="flex-1 min-w-[8rem] font-medium">${u.name}${u.isCommissioner ? ' \u2B50' : ''}${u.purged ? ' <span class="text-[10px] text-red-400 border border-red-500/60 rounded px-1">PURGED</span>' : ''}</span>
+      <select class="season-lineup-div bg-black border border-gray-700 rounded-lg px-2 py-1 text-sm" data-pin="${pin}">${opts(u.division ? String(u.division).toLowerCase() : '')}</select>
+      ${!u.division && !u.isCommissioner ? `<button type="button" class="season-lineup-delete text-xs text-red-400 hover:text-red-300" data-pin="${pin}">Delete team</button>` : ''}
+    </div>`).join('') || '<p class="text-gray-500 text-sm">No teams</p>';
+  el.querySelectorAll('.season-lineup-delete').forEach(b => b.addEventListener('click', () => deleteLeagueTeam(b.dataset.pin)));
+  const addDiv = document.getElementById('season-add-div');
+  if (addDiv) addDiv.innerHTML = divs.map(d => `<option value="${d}">${divisionLabel(d)}</option>`).join('');
+}
+
+async function saveSeasonLineup() {
+  if (guardReadOnly('change the season lineup')) return;
+  if (!isCommissioner()) return alert('Only the commissioner can set teams.');
+  const blocked = await draftBlocksLineupChange();
+  if (blocked) return alert(blocked);
+  const changes = [...document.querySelectorAll('.season-lineup-div')]
+    .map(sel => ({ pin: sel.dataset.pin, division: sel.value || null }))
+    .filter(c => (data.users[c.pin]?.division || null) !== c.division);
+  if (!changes.length) return alert('No changes.');
+  const { data: drafts } = await window.supabaseClient.from('drafts').select('division, status, order_locked, order_pins');
+  const touched = new Set(changes.flatMap(c => [data.users[c.pin]?.division, c.division]).filter(Boolean));
+  const locked = (drafts || []).filter(d => touched.has(d.division) && d.status === 'idle' && d.order_locked && (d.order_pins || []).length);
+  if (locked.length) return alert(`${locked.map(d => d.division.toUpperCase()).join(', ')} draft order is already locked by the Draft Fight. Set teams BEFORE running the Draft Fight.`);
+  if (!confirm('Save season lineup?\n\n' + changes.map(c => `${data.users[c.pin]?.name || c.pin}: ${c.division ? divisionLabel(c.division) : 'Not playing'}`).join('\n'))) return;
+  for (const c of changes) {
+    const { error } = await window.supabaseClient.from('teams').update({ division: c.division }).eq('pin', c.pin);
+    if (error) return alert(isDivisionCheckError(error) ? DIVISION_MIGRATION_MSG : 'Could not update ' + (data.users[c.pin]?.name || c.pin) + ': ' + error.message);
+  }
+  await loadAllData();
+  renderCommissioner();
+  try { renderStandings(); } catch (e) {}
+  alert('Season lineup saved.');
+}
+
+async function addLeagueTeam() {
+  if (guardReadOnly('add a team')) return;
+  if (!isCommissioner()) return alert('Only the commissioner can add teams.');
+  const name = (document.getElementById('season-add-name')?.value || '').trim();
+  const pin = (document.getElementById('season-add-pin')?.value || '').trim().toLowerCase();
+  const division = document.getElementById('season-add-div')?.value || null;
+  if (!name) return alert('Enter the owner name.');
+  if (!pin || pin.length > 10 || !/^[a-z0-9]+$/.test(pin)) return alert('PIN must be 1–10 letters or numbers only.');
+  if (data.users[pin]) return alert('That PIN is already taken.');
+  const blocked = await draftBlocksLineupChange();
+  if (blocked) return alert(blocked);
+  if (!confirm(`Add ${name} (${division ? divisionLabel(division) : 'no division'}) with PIN "${pin}"?\n\nGive them the PIN privately — they can change it under My Team.`)) return;
+  const { error } = await window.supabaseClient.from('teams').insert({
+    pin, name, division, is_commissioner: false, max_roster: 8, roster: [], points: 0, last_delta: null, purged: false
+  });
+  if (error) return alert(isDivisionCheckError(error) ? DIVISION_MIGRATION_MSG : 'Could not add team: ' + error.message);
+  document.getElementById('season-add-name').value = '';
+  document.getElementById('season-add-pin').value = '';
+  await loadAllData();
+  renderCommissioner();
+  alert(name + ' added.');
+}
+
+async function deleteLeagueTeam(pin) {
+  if (guardReadOnly('delete a team')) return;
+  if (!isCommissioner()) return;
+  const u = data.users[pin];
+  if (!u || u.division || u.isCommissioner) return alert('Set the team to "Not playing" first.');
+  if (!confirm(`DELETE ${u.name} from the league permanently?\n\nTheir PIN stops working and their waiver claims / Foreign Objects are deleted. "Not playing" already keeps them out of this season — only delete if they are gone for good.`)) return;
+  const { error } = await window.supabaseClient.from('teams').delete().eq('pin', pin);
+  if (error) return alert('Could not delete: ' + error.message);
+  await loadAllData();
+  renderCommissioner();
 }
 
 async function loadCalendarEvents() {
@@ -1181,6 +1447,8 @@ async function loadAllData() {
   const { data: settings } = await sb.from('settings').select('*');
   const deadlineRow = (settings || []).find(s => s.key === 'waiver_deadline');
   data.waiverDeadline = deadlineRow ? deadlineRow.value : null;
+  const modeRow = (settings || []).find(s => s.key === 'roster_mode');
+  data.rosterMode = modeRow && modeRow.value === 'shared' ? 'shared' : 'separate';
   data.divisionSetup = null;
   const divRow = (settings || []).find(s => s.key === 'division_setup');
   if (divRow && divRow.value) {
@@ -1570,25 +1838,17 @@ async function saveDivisionSetup() {
   if (typeof guardReadOnly === 'function' && guardReadOnly('change divisions')) return;
   const msg = document.getElementById('div-setup-msg');
   const count = parseInt(document.getElementById('div-setup-count')?.value, 10) || 1;
-  let names = [];
-  if (count === 1) {
-    names = [{ slug: 'league', name: 'Overall' }];
-  } else {
-    names = [];
-    for (let i = 0; i < count; i++) {
-      const raw = (document.getElementById('div-setup-name-' + i)?.value || '').trim();
-      if (!raw) {
-        if (msg) { msg.textContent = 'Name every division.'; msg.className = 'text-sm mt-2 text-red-400'; }
-        return;
-      }
-      let slug = raw.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || ('div' + (i + 1));
-      if (slug === 'east_coast') slug = 'east';
-      if (slug === 'west_coast') slug = 'west';
-      if (names.some(n => n.slug === slug)) slug = slug + '_' + (i + 1);
-      names.push({ slug, name: raw });
-    }
+  const built = buildDivisionSetup(count, Array.from({ length: count }, (_, i) => document.getElementById('div-setup-name-' + i)?.value || ''));
+  if (built.error) {
+    if (msg) { msg.textContent = built.error; msg.className = 'text-sm mt-2 text-red-400'; }
+    return;
   }
-  const setup = { count, names };
+  const setup = built.setup;
+  const problem = await ensureDivisionsAllowed(setup.names.map(n => n.slug));
+  if (problem) {
+    if (msg) { msg.textContent = problem; msg.className = 'text-sm mt-2 text-red-400'; }
+    return;
+  }
   const { error } = await window.supabaseClient.from('settings').upsert({
     key: 'division_setup',
     value: JSON.stringify(setup)
@@ -1600,9 +1860,9 @@ async function saveDivisionSetup() {
   data.divisionSetup = setup;
   if (count === 1) {
     for (const [pin, u] of Object.entries(data.users || {})) {
-      if (!u || u.readOnly || pin === 'doublej') continue;
-      await window.supabaseClient.from('teams').update({ division: 'league' }).eq('pin', pin);
-      u.division = 'league';
+      if (!u || u.readOnly || pin === 'doublej' || !u.division) continue;
+      const { error: tErr } = await window.supabaseClient.from('teams').update({ division: setup.names[0].slug }).eq('pin', pin);
+      if (!tErr) u.division = setup.names[0].slug;
     }
   }
   if (msg) { msg.textContent = count === 1 ? 'Saved. Standings are Overall only.' : 'Saved. Division boards will use those names.'; msg.className = 'text-sm mt-2 text-emerald-400'; }
@@ -1806,7 +2066,14 @@ function getAvailableWrestlers(division = null) {
   }
 
   let list;
-  if (!division) {
+  if (isSharedRosterPool()) {
+    // One AEW roster: anyone on any team is taken
+    const taken = new Set();
+    Object.values(data.users).forEach(u => {
+      if (u && !u.readOnly) (u.roster || []).forEach(w => taken.add(w.toLowerCase().trim()));
+    });
+    list = data.masterRoster.filter(w => !taken.has(w.toLowerCase().trim()));
+  } else if (!division) {
     list = data.masterRoster.slice();
   } else {
     // Case-insensitive set of taken names in this division
@@ -2162,6 +2429,12 @@ function renderScoringTable() {
 
 function renderCommissioner() {
   try { fillDivisionSetupForm(); } catch (e) {}
+  try { renderSeasonLineup(); } catch (e) { console.warn(e); }
+  try { fillNewSeasonForm(); } catch (e) { console.warn(e); }
+  try {
+    const wr = document.getElementById('wheel-region');
+    if (wr) { const cur = wr.value; wr.innerHTML = getLeagueDivisions().map(d => `<option value="${d}">${divisionLabel(d)}</option>`).join(''); if (cur) wr.value = cur; }
+  } catch (e) {}
   try { renderCommishTradeQueue(); } catch (e) {}
   try { renderCalendarAdmin(); } catch (e) { console.warn(e); }
   try { fillWrestlerNameList(); } catch (e) {}
@@ -2531,22 +2804,29 @@ async function processWaivers(opts = {}) {
   if (log) log.innerHTML = '<p class="text-gray-400">Processing...</p>';
   const results = [];
 
-  for (const div of ['east', 'west']) {
+  // Separate rosters: each division runs on its own. Shared roster: one league-wide
+  // pass so every claim competes for the same free agents.
+  const waiverGroups = isSharedRosterPool() ? [getLeagueDivisions()] : getLeagueDivisions().map(d => [d]);
+  for (const groupDivs of waiverGroups) {
     // Worst → first (lowest points first). Tie: stable by pin for determinism
     const order = Object.entries(data.users)
-      .filter(([_, u]) => u.division === div && !u.purged)
+      .filter(([_, u]) => groupDivs.includes(u.division) && !u.purged)
       .map(([pin, u]) => ({ pin, name: u.name, points: data.points[pin] || 0 }))
       .sort((a, b) => (a.points - b.points) || String(a.pin).localeCompare(String(b.pin)));
 
-    // Check if Waiver Disrupter is active for this division
-    let disrupterPin = null;
-    try {
-      const { data: sett } = await window.supabaseClient.from('settings').select('value').eq('key', 'waiver_disrupter_' + div).maybeSingle();
-      disrupterPin = sett?.value || null;
-    } catch(e) {}
+    // Waiver Disrupter is per division (blocks others in the activator's division)
+    const disrupters = {};
+    for (const d of groupDivs) {
+      try {
+        const { data: sett } = await window.supabaseClient.from('settings').select('value').eq('key', 'waiver_disrupter_' + d).maybeSingle();
+        if (sett?.value) disrupters[d] = sett.value;
+      } catch(e) {}
+    }
 
     for (const team of order) {
       const claim = data.claims[team.pin];
+      const div = data.users[team.pin]?.division;
+      const disrupterPin = disrupters[div] || null;
       if (!claim || !claim.ranked || claim.ranked.length === 0) continue;
 
       // Disrupter: everyone except the activator fails their first attempt
@@ -2606,9 +2886,9 @@ async function processWaivers(opts = {}) {
       }
     }
 
-    // Clear the disrupter flag after processing this division
-    if (disrupterPin) {
-      await window.supabaseClient.from('settings').delete().eq('key', 'waiver_disrupter_' + div);
+    // Clear the disrupter flags after processing
+    for (const d of Object.keys(disrupters)) {
+      await window.supabaseClient.from('settings').delete().eq('key', 'waiver_disrupter_' + d);
     }
   }
 
@@ -3306,7 +3586,7 @@ renderLeagueRosters = function() {
             const isMe = pin === currentUser;
             const sameDiv = data.users[currentUser]?.division === u.division;
             const isPurged = !!u.purged;
-            const canTrade = !isMe && sameDiv && !isPurged;
+            const canTrade = !isMe && (sameDiv || isSharedRosterPool()) && !!u.division && !isPurged;
             const nm = teamDisplayName(pin);
             return `
             <div class="bg-aew-card rounded-xl border ${isPurged ? 'border-red-900/60' : 'border-gray-800'} p-4 ${isPurged ? 'opacity-80' : ''}">
@@ -3754,7 +4034,7 @@ function fillActivateFOExtra() {
     return;
   }
   if (type === 'forced_trade') {
-    const others = Object.entries(data.users).filter(([p, x]) => p !== pin && x.division === u.division && !x.purged);
+    const others = Object.entries(data.users).filter(([p, x]) => p !== pin && x.division && (x.division === u.division || isSharedRosterPool()) && !x.purged);
     extra.innerHTML =
       '<label class="block text-xs text-gray-400 mb-1">Take from</label>' +
       '<select id="fo-ft-target" class="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm mb-2">' +
@@ -3776,9 +4056,7 @@ function fillActivateFOExtra() {
     return;
   }
   if (type === 'waiver_bank') {
-    const taken = new Set();
-    Object.values(data.users).forEach(x => (x.roster || []).forEach(w => taken.add(String(w).toLowerCase())));
-    const fa = (data.masterRoster || []).filter(n => !taken.has(String(n).toLowerCase()));
+    const fa = getAvailableWrestlers(u.division);
     extra.innerHTML =
       '<p class="mb-2 text-xs">Instant pickup. Ignores waiver order.</p>' +
       '<select id="fo-wb-add" class="w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm mb-2">' +
@@ -4401,9 +4679,10 @@ async function makeDraftPick(division, wrestler, isAuto = false, expectedPick = 
   const round = Math.floor(pickIndex / order.length) + 1;
   const pickNumber = pickIndex + 1;
 
-  // Already taken in this division?
-  const taken = new Set((picks || []).map(p => (p.wrestler || '').toLowerCase()));
-  if (taken.has(wrestler.toLowerCase())) return fail('Already drafted in this division');
+  // Already taken? (this division, or the whole league with one shared AEW roster)
+  let taken;
+  try { taken = await loadDraftTaken(division, picks); } catch (e) { return fail(e.message); }
+  if (taken.has(wrestler.toLowerCase().trim())) return fail(isSharedRosterPool() ? 'Already drafted (one AEW roster for the whole league)' : 'Already drafted in this division');
 
   const { data: inserted, error: insErr } = await window.supabaseClient.from('draft_picks').insert({
     division,
@@ -4414,6 +4693,20 @@ async function makeDraftPick(division, wrestler, isAuto = false, expectedPick = 
     is_auto: isAuto
   }).select('id').maybeSingle();
   if (insErr) return fail('Could not save pick: ' + insErr.message);
+
+  // Shared roster: another division's draft may have taken the same wrestler at the
+  // same moment. The DB can't enforce that, so first-inserted row (lowest id) wins.
+  if (isSharedRosterPool() && inserted?.id) {
+    const esc = String(wrestler).replace(/[\\%_]/g, c => '\\' + c);
+    const { data: dupes } = await window.supabaseClient.from('draft_picks').select('id, division')
+      .ilike('wrestler', esc).neq('division', division);
+    const earlier = (dupes || []).find(d => d.id < inserted.id);
+    if (earlier) {
+      await window.supabaseClient.from('draft_picks').delete().eq('id', inserted.id);
+      renderDraft();
+      return fail(wrestler + ' was just drafted in ' + divisionLabel(earlier.division) + '. Pick someone else.');
+    }
+  }
 
   // Claim the slot: only advances if nobody else already did (still this pick, still active).
   // If another client won the race, remove our duplicate row.
@@ -4469,9 +4762,10 @@ async function tryAutopick(division, reason = 'forced') {
   if (reason === 'absent') console.log('Owner absent from draft room — autopicking for', data.users[pin]?.name || pin);
 
   const ranked = await loadAutopick(pin);
-  const taken = new Set((picks || []).map(p => (p.wrestler || '').toLowerCase()));
-  // Also exclude anyone already on any roster in this division from previous season? For new draft we only care about picks so far
-  const available = data.masterRoster.filter(w => !taken.has(w.toLowerCase()));
+  let taken;
+  try { taken = await loadDraftTaken(division, picks); } catch (e) { console.warn('autopick', e); return false; }
+  // Rosters are last season's until the draft finishes — only this season's picks count
+  const available = data.masterRoster.filter(w => !taken.has(w.toLowerCase().trim()));
 
   // 1) Uploaded target / autopick list
   for (const name of ranked) {
@@ -4511,6 +4805,9 @@ async function renderDraft() {
     ? (document.getElementById('draft-div-select')?.value || myDiv)
     : myDiv).toLowerCase();
   const focus = await loadDraftState(focusDiv);
+  let takenNow;
+  try { takenNow = await loadDraftTaken(focusDiv, focus.picks); }
+  catch (e) { console.warn(e); takenNow = new Set((focus.picks || []).map(p => (p.wrestler || '').toLowerCase().trim())); }
 
   // Status bar
   const d = focus.draft;
@@ -4543,8 +4840,7 @@ async function renderDraft() {
       const pin = getSnakePin(d.order_pins, d.current_pick || 0);
       const name = data.users[pin]?.name || pin;
       const isMyTurn = pin === currentUser;
-      const taken = new Set((focus.picks || []).map(p => (p.wrestler || '').toLowerCase()));
-      const available = data.masterRoster.filter(w => !taken.has(w.toLowerCase())).sort((a,b) => getDraftPts(b) - getDraftPts(a) || a.localeCompare(b));
+      const available = data.masterRoster.filter(w => !takenNow.has(w.toLowerCase().trim())).sort((a,b) => getDraftPts(b) - getDraftPts(a) || a.localeCompare(b));
 
       const canPick = isMyTurn || isCommish;
       pickArea.innerHTML = `
@@ -4621,8 +4917,7 @@ async function renderDraft() {
     } else if (d?.status === 'complete') {
       pickArea.innerHTML = '<div class="text-center text-emerald-400 py-4 font-semibold">Draft complete</div>';
     } else {
-      const takenPrep = new Set((focus.picks || []).map(p => (p.wrestler || '').toLowerCase()));
-      const pool = (data.masterRoster || []).filter(w => !takenPrep.has(w.toLowerCase()))
+      const pool = (data.masterRoster || []).filter(w => !takenNow.has(w.toLowerCase().trim()))
         .sort((a,b) => getDraftPts(b) - getDraftPts(a) || a.localeCompare(b));
       const orderReady = d?.order_pins?.length;
       const when = d?.scheduled_at ? new Date(d.scheduled_at) : null;
@@ -5129,14 +5424,13 @@ function renderScoreInputs() {
   const el = document.getElementById('score-inputs');
   if (!el) return;
 
-  const byDiv = { east: [], west: [] };
+  const divs = getLeagueDivisions();
+  const byDiv = {};
+  divs.forEach(d => { byDiv[d] = []; });
   Object.entries(data.users)
     .filter(([_, u]) => u.division)
     .sort((a, b) => a[1].name.localeCompare(b[1].name))
-    .forEach(([pin, u]) => {
-      if (u.division === 'east') byDiv.east.push([pin, u]);
-      else if (u.division === 'west') byDiv.west.push([pin, u]);
-    });
+    .forEach(([pin, u]) => { if (byDiv[u.division]) byDiv[u.division].push([pin, u]); });
 
   const row = ([pin, u]) => {
     const cur = data.points[pin] || 0;
@@ -5149,16 +5443,12 @@ function renderScoreInputs() {
   };
 
   el.innerHTML = `
-    <p class="text-xs text-gray-400 mb-3 md:col-span-2">Enter <strong>new season totals</strong> for every team that scored (East <em>and</em> West), then click <strong>Save Scores</strong> once. Blank = unchanged. Do not save one division at a time.</p>
+    <p class="text-xs text-gray-400 mb-3 md:col-span-2">Enter <strong>new season totals</strong> for every team that scored (every division), then click <strong>Save Scores</strong> once. Blank = unchanged. Do not save one division at a time.</p>
     <div class="grid md:grid-cols-2 gap-6">
-      <div>
-        <h4 class="text-sm font-bold text-blue-400 mb-2">East</h4>
-        ${byDiv.east.map(row).join('') || '<p class="text-gray-500 text-sm">No teams</p>'}
-      </div>
-      <div>
-        <h4 class="text-sm font-bold text-aew-gold mb-2">West</h4>
-        ${byDiv.west.map(row).join('') || '<p class="text-gray-500 text-sm">No teams</p>'}
-      </div>
+      ${divs.map(d => `<div>
+        <h4 class="text-sm font-bold ${divisionColor(d)} mb-2">${divs.length === 1 ? 'All teams' : divisionLabel(d)}</h4>
+        ${byDiv[d].map(row).join('') || '<p class="text-gray-500 text-sm">No teams</p>'}
+      </div>`).join('')}
     </div>`;
 }
 
@@ -5930,6 +6220,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('spin-wheel')?.addEventListener('click', spinWheel);
   document.getElementById('div-setup-count')?.addEventListener('change', renderDivisionSetupNames);
   document.getElementById('div-setup-save')?.addEventListener('click', saveDivisionSetup);
+  document.getElementById('start-new-season-btn')?.addEventListener('click', startNewSeason);
+  document.getElementById('nsn-div-count')?.addEventListener('change', renderNewSeasonDivisionForm);
+  document.getElementById('season-lineup-save')?.addEventListener('click', saveSeasonLineup);
+  document.getElementById('season-add-btn')?.addEventListener('click', addLeagueTeam);
   document.getElementById('flip-coin')?.addEventListener('click', flipCoin);
   document.getElementById('process-waivers')?.addEventListener('click', processWaivers);
   document.getElementById('set-waiver-deadline')?.addEventListener('click', setWaiverDeadlineUI);

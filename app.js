@@ -763,7 +763,26 @@ async function startNewSeason() {
 
   // Step 4: champion of the season that is ending. Step 5: the new season's name.
   const outgoingName = getSeasonName();
-  const champPin = document.getElementById('nsn-champion')?.value || '';
+  const champSel = document.getElementById('nsn-champion');
+  const champPicked = !!(champSel && champSel.dataset && champSel.dataset.dirty);
+  const lead = overallStandingsLeader();
+  let champPin = champSel?.value || '';
+  if (!champPicked) {
+    // Not chosen by hand: use #1 in the Overall standings right now (standings may
+    // have moved since the tab was opened). A tie for first needs a manual pick.
+    if (lead && lead.tie) {
+      try { fillNewSeasonChampionAndName(); } catch (e) {}
+      return alert(lead.tied.join(' and ') + ' are tied for #1 in the Overall standings (' + lead.pts + ' pts). Choose the champion of ' + outgoingName + ' in step 4, or pick "Don\u2019t record a champion".');
+    }
+    if (lead) {
+      if (champPin !== lead.pin) {
+        champPin = lead.pin;
+        if (champSel) champSel.value = lead.pin;
+        const d = document.getElementById('nsn-champion-display');
+        if (d && !(d.dataset && d.dataset.dirty)) d.value = championDisplayName(data.users[lead.pin]);
+      }
+    }
+  }
   if (!champPin) return alert('Choose the champion of ' + outgoingName + ' (step 4), or pick "Don\u2019t record a champion".');
   const newSeasonName = cleanSeasonName(document.getElementById('nsn-season-name')?.value);
   if (!newSeasonName) return alert('Enter the new season\u2019s name (step 5), for example "' + suggestNextSeasonName(outgoingName, 0) + '".');
@@ -791,9 +810,8 @@ async function startNewSeason() {
       if (!champEntry) return alert('Enter the champion\u2019s name to show in Past Champions (step 4).');
       newPastChampions = fresh.list.concat([champEntry]).sort((a, b) => a.season - b.season);
       const pts = Number((data.points || {})[champPin]) || 0;
-      const lead = seasonPointsLeader();
       champLine = `\u2022 ${outgoingName} CHAMPION: ${champEntry.name} (${cu.name}, ${pts} pts) is saved to Past Champions and keeps the \ud83d\udc51 crown\n` +
-        (lead && lead.pin !== champPin ? `   \u26a0\ufe0f The points leader is ${lead.name} (${lead.pts} pts) \u2014 make sure the champion is right\n` : '');
+        (champPicked && lead && !lead.tie && lead.pin !== champPin ? `   \u26a0\ufe0f You picked a different team than #1 in the Overall standings, ${lead.name} (${lead.pts} pts)\n` : '');
     }
   }
   const divProblem = await ensureDivisionsAllowed(slugs);
@@ -6129,14 +6147,19 @@ async function savePastChampionsFromEditor() {
 }
 
 // ---- Start New Season: champion of the ending season + next season name ----
-function seasonPointsLeader() {
-  let best = null;
-  Object.entries(data.users || {}).forEach(([pin, u]) => {
-    if (!u || u.readOnly || !u.division || u.purged) return;
-    const pts = Number((data.points || {})[pin]) || 0;
-    if (!best || pts > best.pts) best = { pin, name: u.name, pts };
-  });
-  return best;
+// #1 in the Overall standings, using the same rule as renderStandings(): every team
+// with a division (not the viewer), purged teams below non-purged, then points high
+// to low. Returns null when there are no teams, or { pin, name, pts, tie, tied: [names] };
+// tie = true when two or more teams share first place (no pre-fill then).
+function overallStandingsLeader() {
+  const rows = Object.entries(data.users || {})
+    .filter(([_, u]) => u && u.division && !u.readOnly)
+    .map(([pin, u]) => ({ pin, name: u.name, pts: Number((data.points || {})[pin]) || 0, purged: !!u.purged }))
+    .sort((a, b) => (a.purged !== b.purged ? (a.purged ? 1 : -1) : b.pts - a.pts));
+  if (!rows.length) return null;
+  const top = rows[0];
+  const tied = rows.filter(r => r.purged === top.purged && r.pts === top.pts);
+  return { pin: top.pin, name: top.name, pts: top.pts, tie: tied.length > 1, tied: tied.map(r => r.name) };
 }
 
 function updateNewSeasonChampionHint() {
@@ -6152,18 +6175,19 @@ function updateNewSeasonChampionHint() {
     else if (!disp.dataset.dirty || disp.dataset.forPin !== pin) { disp.value = championDisplayName(u); disp.dataset.forPin = pin; delete disp.dataset.dirty; }
   }
   if (hint) {
-    const lead = seasonPointsLeader();
-    const parts = [];
-    if (lead) parts.push('Points leader right now: ' + lead.name + ' (' + lead.pts + ' pts).');
-    if (data.fantasyChampion && data.users[data.fantasyChampion]) parts.push('Fantasy League Champion setting: ' + data.users[data.fantasyChampion].name + '.');
-    hint.textContent = parts.join(' ');
+    const lead = overallStandingsLeader();
+    if (!lead) hint.textContent = '';
+    else if (lead.tie) hint.textContent = 'Tied for #1 in the Overall standings: ' + lead.tied.join(', ') + ' (' + lead.pts + ' pts). Pick the champion.';
+    else hint.textContent = '#1 in the Overall standings right now: ' + lead.name + ' (' + lead.pts + ' pts)' + (sel.dataset.dirty ? '.' : ' \u2014 pre-filled.');
   }
 }
 
 function fillNewSeasonChampionAndName() {
   const sel = document.getElementById('nsn-champion');
   if (sel) {
-    const keep = sel.dataset.dirty ? sel.value : (data.fantasyChampion && data.users[data.fantasyChampion] ? data.fantasyChampion : '');
+    // Pre-fill with #1 in the Overall standings (none on a tie) until Devin picks.
+    const lead = overallStandingsLeader();
+    const keep = sel.dataset.dirty ? sel.value : (lead && !lead.tie ? lead.pin : '');
     const teams = Object.entries(data.users || {})
       .filter(([pin, u]) => pin !== 'doublej' && u && !u.readOnly)
       .sort((a, b) => String(a[1].name).localeCompare(String(b[1].name)));

@@ -563,6 +563,15 @@ async function executePurgeCore(opts = {}) {
       }).eq('scheduled_for', data.nextPurgeAt);
     }
   } catch (e) {}
+  // Every division's victim (purge_log.victims). Separate write: before the divisions
+  // migration adds that column this one fails quietly and nothing else changes.
+  try {
+    if (data.nextPurgeAt) {
+      const victimMap = {};
+      byDivVictim.forEach(x => { victimMap[x.div] = x.v.pin; });
+      await window.supabaseClient.from('purge_log').update({ victims: victimMap }).eq('scheduled_for', data.nextPurgeAt);
+    }
+  } catch (e) {}
 
   await loadAllData();
   renderStandings();
@@ -645,22 +654,41 @@ async function loadDraftTaken(division, divisionPicks) {
 }
 
 /** Division setup from a count + raw names (shared by the Divisions panel and Start New Season).
- *  1 division and 2 divisions map onto the DB's existing slugs (east / west), so they
- *  work without a migration. 3+ divisions need the division CHECK constraints relaxed. */
-function buildDivisionSetup(count, rawNames) {
-  count = Math.max(1, Math.min(8, parseInt(count, 10) || 1));
+ *  Any number of divisions (1 to MAX_DIVISIONS). 1 division and 2 divisions map onto the
+ *  original slugs (east / west), so they also work before the "any number of divisions"
+ *  migration. 3+ divisions get a slug from each name (lowercase letters, digits, _; at
+ *  most 40 characters), which needs that migration (the database check allows 1-64). */
+const MAX_DIVISIONS = 50;
+function parseDivisionCount(v) {
+  const n = Number(String(v ?? '').trim());
+  return Number.isInteger(n) && n >= 1 && n <= MAX_DIVISIONS ? n : null;
+}
+function divisionSlugFromName(raw, i) {
+  let slug = String(raw || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40).replace(/_+$/g, '');
+  if (!slug) slug = 'div' + (i + 1);
+  if (slug === 'east_coast') slug = 'east';
+  if (slug === 'west_coast') slug = 'west';
+  return slug;
+}
+// keepSlugs (optional): the current division keys, reused by position for 3+ divisions so
+// renaming a division in the Divisions panel keeps its teams (keys are what teams store).
+function buildDivisionSetup(count, rawNames, keepSlugs) {
+  count = parseDivisionCount(count);
+  if (!count) return { error: 'Enter how many divisions (a whole number from 1 to ' + MAX_DIVISIONS + ').' };
   if (count === 1) return { setup: { count: 1, names: [{ slug: 'east', name: 'Overall' }] } };
   const names = [];
   for (let i = 0; i < count; i++) {
-    const raw = String((rawNames || [])[i] || '').trim();
+    const raw = String((rawNames || [])[i] || '').replace(/\s+/g, ' ').trim();
     if (!raw) return { error: 'Name every division.' };
+    if (raw.length > 40) return { error: 'Division names can be at most 40 characters ("' + raw.slice(0, 20) + '\u2026").' };
+    if (names.some(n => n.name.toLowerCase() === raw.toLowerCase())) return { error: 'Two divisions are both named "' + raw + '". Give each division its own name.' };
     let slug;
     if (count === 2) slug = i === 0 ? 'east' : 'west';
+    else if (keepSlugs && keepSlugs[i] && /^[a-z0-9_]{1,64}$/.test(keepSlugs[i]) && !names.some(n => n.slug === keepSlugs[i])) slug = keepSlugs[i];
     else {
-      slug = raw.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || ('div' + (i + 1));
-      if (slug === 'east_coast') slug = 'east';
-      if (slug === 'west_coast') slug = 'west';
-      if (names.some(n => n.slug === slug)) slug = slug + '_' + (i + 1);
+      const base = divisionSlugFromName(raw, i);
+      slug = base;
+      for (let k = 2; names.some(n => n.slug === slug); k++) slug = base.slice(0, 36) + '_' + k;
     }
     names.push({ slug, name: raw });
   }
@@ -668,7 +696,7 @@ function buildDivisionSetup(count, rawNames) {
 }
 
 const DIVISION_MIGRATION_MSG = 'The database only allows the divisions East and West. ' +
-  'To use other divisions, apply the "divisions" migration from the Start New Season pull request first. Nothing was changed.';
+  'To use 3 or more divisions, apply the "any number of divisions" migration (supabase/migrations/20261018200000_any_number_of_divisions.sql) first. Nothing was changed.';
 
 function isDivisionCheckError(err) {
   return !!err && (err.code === '23514' || /division_check/i.test(String(err.message || '')));
@@ -693,7 +721,7 @@ function renderNewSeasonDivisionForm() {
   const box = document.getElementById('nsn-div-names');
   const modeBox = document.getElementById('nsn-roster-mode-box');
   if (!countEl || !box) return;
-  const count = parseInt(countEl.value, 10) || 1;
+  const count = Math.min(MAX_DIVISIONS, parseInt(countEl.value, 10) || 1);
   const existing = (getDivisionSetup().names || []).map(n => n.name);
   const prev = [...box.querySelectorAll('input')].map(i => i.value);
   box.innerHTML = count <= 1 ? '' : Array.from({ length: count }, (_, i) => {
@@ -2048,7 +2076,7 @@ function fillDivisionSetupForm() {
 }
 
 function renderDivisionSetupNames() {
-  const count = parseInt(document.getElementById('div-setup-count')?.value, 10) || 1;
+  const count = Math.min(MAX_DIVISIONS, parseInt(document.getElementById('div-setup-count')?.value, 10) || 1);
   const box = document.getElementById('div-setup-names');
   const hint = document.getElementById('div-setup-hint');
   if (!box) return;
@@ -2059,8 +2087,9 @@ function renderDivisionSetupNames() {
   }
   if (hint) hint.textContent = 'Name every division. Those names are the boards above Overall.';
   const existing = (getDivisionSetup().names || []).map(n => n.name);
+  const prev = [...box.querySelectorAll('input')].map(i => i.value);
   box.innerHTML = Array.from({ length: count }, (_, i) => {
-    const val = (existing[i] || '').replace(/"/g, '"');
+    const val = String(prev[i] ?? existing[i] ?? '').replace(/"/g, '&quot;');
     return `<label class="block text-xs text-gray-400">Division ${i + 1} name
       <input id="div-setup-name-${i}" type="text" value="${val}" placeholder="e.g. East Coast" class="mt-1 w-full bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-white" />
     </label>`;
@@ -2071,7 +2100,10 @@ async function saveDivisionSetup() {
   if (typeof guardReadOnly === 'function' && guardReadOnly('change divisions')) return;
   const msg = document.getElementById('div-setup-msg');
   const count = parseInt(document.getElementById('div-setup-count')?.value, 10) || 1;
-  const built = buildDivisionSetup(count, Array.from({ length: count }, (_, i) => document.getElementById('div-setup-name-' + i)?.value || ''));
+  // Same number of divisions as now = a rename: keep each division's key so its teams stay put.
+  const cur = data.divisionSetup && Array.isArray(data.divisionSetup.names) ? data.divisionSetup.names : [];
+  const keep = cur.length === count && count >= 3 ? cur.map(n => n.slug) : null;
+  const built = buildDivisionSetup(count, Array.from({ length: count }, (_, i) => document.getElementById('div-setup-name-' + i)?.value || ''), keep);
   if (built.error) {
     if (msg) { msg.textContent = built.error; msg.className = 'text-sm mt-2 text-red-400'; }
     return;
@@ -2169,6 +2201,7 @@ function renderStandings() {
       grid.innerHTML = '';
     } else {
       grid.classList.remove('hidden');
+      grid.classList.toggle('lg:grid-cols-3', named.length >= 3);
       grid.innerHTML = named.map((d, i) => `
         <div>
           <div class="flex items-center justify-between mb-3">
@@ -2813,7 +2846,7 @@ function publishWheelSpin(payload) {
 }
 
 async function broadcastWheelResult(region, label) {
-  const msg = 'WHEEL OF BOOM — ' + String(region || '').toUpperCase() + '\nResult: ' + String(label || '').replace(/\n/g, ' ');
+  const msg = 'WHEEL OF BOOM — ' + String(region || '').replace(/_/g, ' ').toUpperCase() + '\nResult: ' + String(label || '').replace(/\n/g, ' ');
   try {
     await window.supabaseClient.from('broadcasts').insert({
       from_pin: currentUser || 'system',
@@ -2843,7 +2876,7 @@ function showWheelLiveModal(ev, isReplay) {
   const canvas = document.getElementById('wheel-live-canvas');
   if (!modal || !canvas) return;
   modal.classList.remove('hidden');
-  if (sub) sub.textContent = (isReplay ? 'Replay — ' : 'LIVE — ') + String(ev.region || '').toUpperCase();
+  if (sub) sub.textContent = (isReplay ? 'Replay — ' : 'LIVE — ') + String(ev.region || '').replace(/_/g, ' ').toUpperCase();
   if (res) res.textContent = ev.spinning ? 'Spinning...' : (ev.label || '');
   const elapsed = ev.startedAt ? Date.now() - new Date(ev.startedAt).getTime() : 99999;
   const dur = ev.durationMs || 4200;
@@ -2904,7 +2937,7 @@ function spinWheel() {
   wheelRotation = targetRotation;
   const canvas = document.getElementById('wheel-canvas');
   const result = WHEEL_SEGMENTS[randomIndex];
-  const region = document.getElementById('wheel-region')?.value || 'east';
+  const region = document.getElementById('wheel-region')?.value || getLeagueDivisions()[0] || 'east';
   const label = String(result.label || '').replace(/\n/g, ' ');
   const ev = {
     id: 'w' + Date.now(),
@@ -2921,7 +2954,7 @@ function spinWheel() {
   publishWheelSpin(ev);
   playWheelOnCanvas(canvas, targetRotation, 4200, () => {
     document.getElementById('wheel-result').innerHTML =
-      '<span class="text-aew-gold">' + label + '</span><br><span class="text-sm text-gray-400">' + region.toUpperCase() + ' — sent live to the league</span>';
+      '<span class="text-aew-gold">' + label + '</span><br><span class="text-sm text-gray-400">' + region.replace(/_/g, ' ').toUpperCase() + ' — sent live to the league</span>';
     isSpinning = false;
     ev.spinning = false;
     publishWheelSpin(ev);
@@ -4639,7 +4672,7 @@ function applyDraftFightFrame(url) {
 async function saveDraftFightUrl() {
   if (guardReadOnly('save a Draft Fight link')) return;
   if (typeof isCommissioner === 'function' && !isCommissioner()) return;
-  const div = document.getElementById('draft-div-select')?.value || data.users[currentUser]?.division || 'east';
+  const div = document.getElementById('draft-div-select')?.value || data.users[currentUser]?.division || getLeagueDivisions()[0] || 'east';
   let url = (document.getElementById('draft-fight-url')?.value || '').trim();
   const msg = document.getElementById('draft-fight-msg');
   if (url && !/^https:\/\/(www\.)?draftfight\.com\//i.test(url)) {
@@ -4730,7 +4763,7 @@ function parseDraftFightResult(text, pins) {
 }
 
 function applyDraftFightPaste() {
-  const div = document.getElementById('draft-div-select')?.value || 'east';
+  const div = document.getElementById('draft-div-select')?.value || getLeagueDivisions()[0] || 'east';
   const pins = draftEligiblePins(div);
   const { order, ignored } = parseDraftFightResult(document.getElementById('draft-fight-paste')?.value, pins);
   document.querySelectorAll('.draft-fight-slot').forEach((sel, i) => { sel.value = order[i] || ''; });
@@ -4744,7 +4777,7 @@ function applyDraftFightPaste() {
 async function lockDraftFightOrder() {
   if (guardReadOnly('lock the draft order')) return;
   if (!isCommissioner()) return alert('Only the commissioner can lock the draft order.');
-  const div = document.getElementById('draft-div-select')?.value || 'east';
+  const div = document.getElementById('draft-div-select')?.value || getLeagueDivisions()[0] || 'east';
   const pins = draftEligiblePins(div);
   const order = [...document.querySelectorAll('.draft-fight-slot')].map(s => s.value);
   if (!pins.length || order.length !== pins.length || order.some(p => !p)) return alert('Fill every pick slot with the Draft Fight finishing order.');
@@ -5158,7 +5191,7 @@ async function renderDraft() {
 
 async function setDraftSchedule() {
   if (guardReadOnly('schedule the draft')) return;
-  const div = document.getElementById('draft-div-select')?.value || 'east';
+  const div = document.getElementById('draft-div-select')?.value || getLeagueDivisions()[0] || 'east';
   const date = document.getElementById('draft-schedule-date')?.value;
   const time = document.getElementById('draft-schedule-time')?.value;
   if (!date || !time) return alert('Pick a date and time');
@@ -5694,7 +5727,7 @@ async function saveScores() {
     scored.push({ pin, newTotal, name: data.users[pin]?.name || pin });
   }
   if (scored.length === 0) {
-    alert('Enter the new total for at least one team.\n\nTip: Fill East AND West, then Save once.');
+    alert('Enter the new total for at least one team.\n\nTip: Fill ' + (getLeagueDivisions().join() === 'east,west' ? 'East AND West' : 'every division') + ', then Save once.');
     return;
   }
 
@@ -5757,7 +5790,7 @@ async function saveScores() {
   if (failed.length) {
     alert('Saved ' + okCount + ' team(s), but FAILED for: ' + failed.map(f => data.users[f.pin]?.name || f.pin).join(', ') + '\nPoints for failed teams were NOT changed.');
   } else {
-    alert('Saved points for ' + okCount + ' team(s) (East + West in one save). Standings updated.');
+    alert('Saved points for ' + okCount + ' team(s) (' + (getLeagueDivisions().join() === 'east,west' ? 'East + West' : 'all divisions') + ' in one save). Standings updated.');
   }
 }
 
@@ -6406,19 +6439,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('rescind-entire-claim')?.addEventListener('click', rescindEntireClaim);
   
   document.getElementById('draft-generate-order')?.addEventListener('click', () => {
-    const div = document.getElementById('draft-div-select')?.value || 'east';
+    const div = document.getElementById('draft-div-select')?.value || getLeagueDivisions()[0] || 'east';
     generateDraftOrder(div);
   });
   document.getElementById('draft-start')?.addEventListener('click', () => {
-    const div = document.getElementById('draft-div-select')?.value || 'east';
+    const div = document.getElementById('draft-div-select')?.value || getLeagueDivisions()[0] || 'east';
     if (confirm('Start ' + div.toUpperCase() + ' draft? This clears any previous picks for that division.')) startDraft(div);
   });
   document.getElementById('draft-pause')?.addEventListener('click', () => {
-    const div = document.getElementById('draft-div-select')?.value || 'east';
+    const div = document.getElementById('draft-div-select')?.value || getLeagueDivisions()[0] || 'east';
     setDraftStatus(div, 'paused');
   });
   document.getElementById('draft-resume')?.addEventListener('click', () => {
-    const div = document.getElementById('draft-div-select')?.value || 'east';
+    const div = document.getElementById('draft-div-select')?.value || getLeagueDivisions()[0] || 'east';
     setDraftStatus(div, 'active');
   });
   document.getElementById('draft-div-select')?.addEventListener('change', () => renderDraft());
@@ -6713,9 +6746,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   document.getElementById('spin-wheel')?.addEventListener('click', spinWheel);
   document.getElementById('div-setup-count')?.addEventListener('change', renderDivisionSetupNames);
+  document.getElementById('div-setup-count')?.addEventListener('input', renderDivisionSetupNames);
   document.getElementById('div-setup-save')?.addEventListener('click', saveDivisionSetup);
   document.getElementById('start-new-season-btn')?.addEventListener('click', startNewSeason);
   document.getElementById('nsn-div-count')?.addEventListener('change', renderNewSeasonDivisionForm);
+  document.getElementById('nsn-div-count')?.addEventListener('input', renderNewSeasonDivisionForm);
   document.getElementById('season-lineup-save')?.addEventListener('click', saveSeasonLineup);
   document.getElementById('season-add-btn')?.addEventListener('click', addLeagueTeam);
   document.getElementById('reset-pin-btn')?.addEventListener('click', commishResetPin);

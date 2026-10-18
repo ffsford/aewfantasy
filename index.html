@@ -216,7 +216,7 @@
 
         <div class="mb-6 p-4 bg-aew-card rounded-xl border border-gray-800">
           <p class="font-medium text-white mb-1">Trades</p>
-          <p class="text-sm text-gray-300">You may trade at any point (except when a show is live). Both rosters must end at 8 wrestlers after the trade (or 9 if a player has the Foreign Object roster expansion). Trades are locked in the last 30 days of the season and can be subject to veto.</p>
+          <p class="text-sm text-gray-300">You may trade at any point (except when a show is live). Both rosters must end at <span data-roster-spots>8</span> wrestlers after the trade (or <span data-roster-spots-bonus>9</span> if a player has the Foreign Object roster expansion). Trades are locked in the last 30 days of the season and can be subject to veto.</p>
         </div>
 
           <div class="flex gap-2 mb-6">
@@ -466,7 +466,7 @@
 
         <div class="bg-aew-card rounded-xl border border-emerald-700/60 p-4 mt-6">
           <h3 class="font-bold mb-1 text-emerald-400">Start New Season</h3>
-          <p class="text-xs text-gray-500 mb-3">Order: <strong class="text-gray-300">1. Start New Season</strong> (divisions + AEW roster below) → <strong class="text-gray-300">2. Season Lineup</strong> (who plays, which division) → <strong class="text-gray-300">3. Season Dates</strong> → <strong class="text-gray-300">4. Draft</strong> tab: schedule, run the Draft Fight, lock the order, Start Draft. Un-purges everyone, zeroes team points, roster size back to 8, clears last season’s finished drafts, removes held Foreign Objects, cancels open trades, clears waiver claims and the waiver deadline. Rosters are left alone (the draft replaces them).</p>
+          <p class="text-xs text-gray-500 mb-3">Order: <strong class="text-gray-300">1. Start New Season</strong> (divisions, AEW roster and roster spots below) → <strong class="text-gray-300">2. Season Lineup</strong> (who plays, which division) → <strong class="text-gray-300">3. Season Dates</strong> → <strong class="text-gray-300">4. Draft</strong> tab: schedule, run the Draft Fight, lock the order, Start Draft. Un-purges everyone, zeroes team points, roster size back to 8, clears last season’s finished drafts, removes held Foreign Objects, cancels open trades, clears waiver claims and the waiver deadline. Rosters are left alone (the draft replaces them).</p>
           <div class="mb-3">
             <label class="block text-xs text-gray-400 mb-1">1. How many divisions this season?</label>
             <select id="nsn-div-count" class="bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm mb-2">
@@ -486,7 +486,11 @@
             <label class="flex items-start gap-2 text-sm mb-1"><input type="radio" name="nsn-roster-mode" value="shared" class="mt-1" /> <span><strong>One AEW roster</strong> for the whole league — each wrestler can be on only one team. Drafts, free agency, waivers and trades are league-wide.</span></label>
             <label class="flex items-start gap-2 text-sm"><input type="radio" name="nsn-roster-mode" value="separate" class="mt-1" /> <span><strong>Each division gets its own AEW roster</strong> — the same wrestler can be on a team in every division.</span></label>
           </div>
-          <button type="button" id="start-new-season-btn" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-5 py-2 rounded-lg text-sm">3. Start New Season</button>
+          <div class="mb-3">
+            <label for="nsn-roster-spots" class="block text-xs text-gray-400 mb-1">3. Roster spots per team (required — this is also the number of draft rounds)</label>
+            <input id="nsn-roster-spots" type="number" min="1" max="30" step="1" inputmode="numeric" placeholder="e.g. 8" class="w-32 bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm text-white" />
+          </div>
+          <button type="button" id="start-new-season-btn" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-5 py-2 rounded-lg text-sm">4. Start New Season</button>
         </div>
 
         <div class="bg-aew-card rounded-xl border border-aew-gold/40 p-4 mt-6">

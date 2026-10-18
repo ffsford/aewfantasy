@@ -1481,7 +1481,7 @@ function showTab(tabId) {
   if (tabId === 'calendar') renderCalendar();
   if (tabId === 'myteam') renderMyTeam();
   if (tabId === 'transactions') { renderWaiver(); }
-  if (tabId === 'draft') { renderDraft(); }
+  if (tabId === 'draft') { renderDraft(); heartbeatDraftPresence(); }
   if (tabId === 'broadcast') { renderBroadcastTab(); }
   if (tabId === 'past-champions') { renderPastChampions(); }
   if (tabId === 'rules') renderScoringTable();
@@ -4010,8 +4010,25 @@ async function randomizeDivisions() {
   }
 }
 
+// ----- Draft room presence (absent owners get autopicked) -----
+// An owner is "in the draft room" while their Draft tab is open; that client
+// writes a heartbeat every DRAFT_HEARTBEAT_MS. Other clients judge presence by
+// whether the heartbeat value CHANGED within DRAFT_ABSENT_GRACE_MS of their own
+// clock, so device clock differences don't matter and a quick page refresh
+// (a few seconds without heartbeats) is not treated as absent.
+const DRAFT_HEARTBEAT_MS = 5000;
+const DRAFT_ABSENT_GRACE_MS = 15000;
+const DRAFT_ABSENT_CHECK_MS = 4000;
+const draftPresenceSeen = {}; // pin -> { value, seenAt } (local clock)
+let absentAutopickRunning = false;
+
+function isInDraftRoom() {
+  return !!currentUser && document.querySelector('.nav-btn.active')?.dataset?.tab === 'draft';
+}
+
 async function heartbeatDraftPresence() {
   if (!currentUser || !window.supabaseClient) return;
+  if (isReadOnlyViewer() || !isInDraftRoom()) return;
   try {
     await window.supabaseClient.from('settings').upsert({
       key: 'draft_present_' + currentUser,
@@ -4020,22 +4037,33 @@ async function heartbeatDraftPresence() {
   } catch (_) {}
 }
 
-async function isDraftOwnerPresent(pin) {
+async function refreshDraftPresence() {
+  const { data: rows, error } = await window.supabaseClient
+    .from('settings')
+    .select('key, value')
+    .like('key', 'draft_present_%');
+  if (error) throw error;
+  const now = Date.now();
+  const byPin = {};
+  (rows || []).forEach(r => { byPin[String(r.key).slice('draft_present_'.length)] = r.value || ''; });
+  // Track every team (even ones with no row yet) so "never showed up" also ages out
+  const pins = new Set([...Object.keys(data.users || {}), ...Object.keys(byPin)]);
+  pins.forEach(pin => {
+    const value = byPin[pin] || '';
+    const prev = draftPresenceSeen[pin];
+    if (!prev || prev.value !== value) draftPresenceSeen[pin] = { value, seenAt: now };
+  });
+}
+
+function isDraftOwnerPresent(pin) {
   if (!pin) return false;
-  if (pin === currentUser) return true;
-  try {
-    const { data: row } = await window.supabaseClient
-      .from('settings')
-      .select('value')
-      .eq('key', 'draft_present_' + pin)
-      .maybeSingle();
-    if (!row?.value) return false;
-    const t = new Date(row.value).getTime();
-    if (isNaN(t)) return false;
-    return Date.now() - t < 90000; // present if heartbeat in last 90s
-  } catch (_) {
-    return false;
+  if (pin === currentUser && isInDraftRoom()) return true;
+  const seen = draftPresenceSeen[pin];
+  if (!seen) { // not observed yet — start their grace period now
+    draftPresenceSeen[pin] = { value: '', seenAt: Date.now() };
+    return true;
   }
+  return Date.now() - seen.seenAt < DRAFT_ABSENT_GRACE_MS;
 }
 
 async function tryAutoLockDraftOrders() {
@@ -4061,25 +4089,39 @@ async function tryAutoLockDraftOrders() {
 }
 
 async function tryAbsentAutopicks() {
-  if (!window.supabaseClient) return;
+  // Runs in every connected (non view-only) client; the conditional update in
+  // makeDraftPick makes sure only one client's pick lands per slot.
+  if (!window.supabaseClient || !currentUser) return;
   if (isReadOnlyViewer()) return;
-  if (typeof isCommissioner === 'function' && !isCommissioner()) return;
-  for (const div of getLeagueDivisions()) {
-    try {
-      const { draft } = await loadDraftState(div);
-      if (!draft || draft.status !== 'active') continue;
-      const pin = getSnakePin(draft.order_pins || [], draft.current_pick || 0);
-      if (!pin) continue;
-      const present = await isDraftOwnerPresent(pin);
-      if (present) continue; // owner is in the room — wait for them
-      await tryAutopick(div);
-    } catch (e) {
-      console.warn('tryAbsentAutopicks', div, e);
+  if (absentAutopickRunning) return;
+  absentAutopickRunning = true;
+  try {
+    const { data: drafts } = await window.supabaseClient.from('drafts').select('division, status');
+    const active = (drafts || []).filter(d => d.status === 'active').map(d => d.division);
+    if (!active.length) return;
+    await refreshDraftPresence();
+    for (const div of active) {
+      // Keep going through consecutive absent owners; stop at a present one
+      for (let guard = 0; guard < 500; guard++) {
+        const { draft } = await loadDraftState(div);
+        if (!draft || draft.status !== 'active') break;
+        const pin = getSnakePin(draft.order_pins || [], draft.current_pick || 0);
+        if (!pin) break;
+        if (isDraftOwnerPresent(pin)) break; // owner is in the room — wait for them
+        const ok = await tryAutopick(div, 'absent');
+        if (!ok) break; // someone else got there first, or nothing to pick
+      }
     }
+  } catch (e) {
+    console.warn('tryAbsentAutopicks', e);
+  } finally {
+    absentAutopickRunning = false;
   }
 }
 
-
+// Heartbeat + absent check loop (no server: every open client participates)
+setInterval(() => { heartbeatDraftPresence(); }, DRAFT_HEARTBEAT_MS);
+setInterval(() => { tryAbsentAutopicks(); }, DRAFT_ABSENT_CHECK_MS);
 
 function getLeagueDivisions() {
   const setup = getDivisionSetup();
@@ -4193,6 +4235,7 @@ async function startDraft(division) {
     updated_at: new Date().toISOString()
   }).eq('division', division);
   renderDraft();
+  tryAbsentAutopicks();
 }
 
 async function setDraftStatus(division, status) {
@@ -4201,6 +4244,7 @@ async function setDraftStatus(division, status) {
     updated_at: new Date().toISOString()
   }).eq('division', division);
   renderDraft();
+  if (status === 'active') tryAbsentAutopicks();
 }
 
 
@@ -4250,15 +4294,18 @@ async function maybeResetPointsAfterAllDraftsComplete() {
   }
 }
 
-async function makeDraftPick(division, wrestler, isAuto = false) {
-  if (guardReadOnly('draft')) return;
+async function makeDraftPick(division, wrestler, isAuto = false, expectedPick = null) {
+  // Auto picks can run in the background on any client — no popups for them
+  const fail = (m) => { if (isAuto) console.log('Autopick skipped:', m); else alert(m); return false; };
+  if (isAuto ? isReadOnlyViewer() : guardReadOnly('draft')) return false;
   const { draft, picks } = await loadDraftState(division);
-  if (!draft || draft.status !== 'active') return alert('Draft is not active');
+  if (!draft || draft.status !== 'active') return fail('Draft is not active');
 
   const order = draft.order_pins || [];
   const pickIndex = draft.current_pick || 0;
+  if (expectedPick !== null && pickIndex !== expectedPick) return fail('Pick already made');
   const totalPicks = order.length * DRAFT_ROUNDS;
-  if (pickIndex >= totalPicks) return alert('Draft is complete');
+  if (pickIndex >= totalPicks) return fail('Draft is complete');
 
   const pin = getSnakePin(order, pickIndex);
   const round = Math.floor(pickIndex / order.length) + 1;
@@ -4266,24 +4313,33 @@ async function makeDraftPick(division, wrestler, isAuto = false) {
 
   // Already taken in this division?
   const taken = new Set((picks || []).map(p => (p.wrestler || '').toLowerCase()));
-  if (taken.has(wrestler.toLowerCase())) return alert('Already drafted in this division');
+  if (taken.has(wrestler.toLowerCase())) return fail('Already drafted in this division');
 
-  await window.supabaseClient.from('draft_picks').insert({
+  const { data: inserted, error: insErr } = await window.supabaseClient.from('draft_picks').insert({
     division,
     pick_number: pickNumber,
     round,
     pin,
     wrestler,
     is_auto: isAuto
-  });
+  }).select('id').maybeSingle();
+  if (insErr) return fail('Could not save pick: ' + insErr.message);
 
+  // Claim the slot: only advances if nobody else already did (still this pick, still active).
+  // If another client won the race, remove our duplicate row.
   const nextPick = pickIndex + 1;
   const done = nextPick >= totalPicks;
-  await window.supabaseClient.from('drafts').update({
+  const { data: claimed, error: claimErr } = await window.supabaseClient.from('drafts').update({
     current_pick: nextPick,
     status: done ? 'complete' : 'active',
     updated_at: new Date().toISOString()
-  }).eq('division', division);
+  }).eq('division', division).eq('current_pick', pickIndex).eq('status', 'active').select('division');
+  if (claimErr || !claimed || !claimed.length) {
+    if (inserted?.id) await window.supabaseClient.from('draft_picks').delete().eq('id', inserted.id);
+    renderDraft();
+    return fail(claimErr ? 'Could not save pick: ' + claimErr.message : 'That pick was already made (or the draft was paused). Board refreshed.');
+  }
+  if (isAuto) console.log('Autopick:', division, '#' + pickNumber, data.users[pin]?.name || pin, '→', wrestler);
 
   // If complete, write final rosters; when ALL division drafts are done, zero scores for new season
   if (done) {
@@ -4295,6 +4351,7 @@ async function makeDraftPick(division, wrestler, isAuto = false) {
   }
 
   renderDraft();
+  return true;
 }
 
 async function finalizeDraftRosters(division) {
@@ -4311,14 +4368,15 @@ async function finalizeDraftRosters(division) {
   alert(division.toUpperCase() + ' draft complete. Rosters updated.');
 }
 
-async function tryAutopick(division) {
-  if (isReadOnlyViewer()) return;
+async function tryAutopick(division, reason = 'forced') {
+  if (isReadOnlyViewer()) return false;
   const { draft, picks } = await loadDraftState(division);
-  if (!draft || draft.status !== 'active') return;
+  if (!draft || draft.status !== 'active') return false;
   const order = draft.order_pins || [];
   const pickIndex = draft.current_pick || 0;
   const pin = getSnakePin(order, pickIndex);
-  if (!pin) return;
+  if (!pin) return false;
+  if (reason === 'absent') console.log('Owner absent from draft room — autopicking for', data.users[pin]?.name || pin);
 
   const ranked = await loadAutopick(pin);
   const taken = new Set((picks || []).map(p => (p.wrestler || '').toLowerCase()));
@@ -4329,15 +4387,15 @@ async function tryAutopick(division) {
   for (const name of ranked) {
     const match = available.find(a => a.toLowerCase() === name.toLowerCase());
     if (match) {
-      await makeDraftPick(division, match, true);
-      return;
+      return await makeDraftPick(division, match, true, pickIndex);
     }
   }
   // 2) No list / nothing left on list → best available by prior-season points
   const bpa = available.slice().sort((a, b) => getDraftPts(b) - getDraftPts(a) || a.localeCompare(b));
   if (bpa.length) {
-    await makeDraftPick(division, bpa[0], true);
+    return await makeDraftPick(division, bpa[0], true, pickIndex);
   }
+  return false;
 }
 
 async function renderDraft() {
@@ -4513,7 +4571,7 @@ async function renderDraft() {
           <span class="text-gray-400 w-12">R${p.round}</span>
           <span class="font-medium w-20 truncate">${data.users[p.pin]?.name || p.pin}</span>
           ${p.wrestler ? portraitHtml(p.wrestler, 'h-12 w-12') : ''}
-          <span class="${p.is_auto ? 'text-gray-400 italic' : 'text-white'} truncate">${p.wrestler || '—'}${p.is_auto ? ' (auto)' : ''}</span>
+          <span class="${p.is_auto ? 'text-gray-400 italic' : 'text-white'} truncate"${p.is_auto ? ' title="Autopicked: owner not in the draft room (or commissioner forced it)"' : ''}>${p.wrestler || '—'}${p.is_auto ? ' (autopick)' : ''}</span>
         </div>
       `).join('');
     }

@@ -629,7 +629,10 @@ async function startNewSeason() {
     `• Un-purge every team${purged.length ? ' (' + purged.join(', ') + ')' : ''}\n` +
     '• Team standings points and last-show change go to 0\n' +
     '• Roster size goes back to 8 (Foreign Object 9th spot ends)\n' +
-    '• Last season\u2019s finished drafts are cleared (picks, order, lock) so a new Draft Fight can run\n\n' +
+    '• Last season\u2019s finished drafts are cleared (picks, order, lock) so a new Draft Fight can run\n' +
+    '• All held Foreign Objects are removed, plus armed FO effects and the last Wheel Of Boom spin\n' +
+    '• Open trade offers are cancelled (finished trade history stays)\n' +
+    '• All waiver claims are cleared and the waiver deadline is removed\n\n' +
     'Record the Fantasy League Champion first — final standings points are wiped.\n' +
     'Rosters are NOT touched (the draft overwrites them). Next: set teams below, then schedule the draft and run the Draft Fight.')) return;
 
@@ -638,6 +641,20 @@ async function startNewSeason() {
     .update({ purged: false, points: 0, last_delta: null, max_roster: 8 })
     .neq('pin', ''); // all teams
   if (error) return alert('Could not reset teams: ' + error.message);
+
+  // Season-level FO / trade / waiver state. History (fo_history, finished trades,
+  // waiver_reports) stays. Autopick lists, trade blocks and the Purge date stay.
+  const problems = [];
+  const step = async (label, q) => { const { error: e } = await q; if (e) problems.push(label + ': ' + e.message); };
+  await step('Foreign Objects', sb.from('foreign_objects').delete().gt('id', 0));
+  await step('armed FO effects', sb.from('settings').delete().in('key', ['ppv_week_pin', 'waiver_disrupter_pin']));
+  await step('Waiver Disrupter flags', sb.from('settings').delete().like('key', 'waiver_disrupter_%'));
+  await step('Wheel Of Boom spin', sb.from('settings').delete().eq('key', 'wheel_live_spin'));
+  await step('open trades', sb.from('trades').update({ status: 'cancelled', resolved_at: new Date().toISOString() })
+    .in('status', ['pending', 'accepted_by_player', 'accepted']));
+  await step('waiver claims', sb.from('claims').delete().neq('pin', ''));
+  await step('waiver claim drops', sb.from('settings').delete().like('key', 'claim_drops_%'));
+  await step('waiver deadline', sb.from('settings').delete().in('key', ['waiver_deadline', 'last_processed_deadline']));
 
   // Clear finished/stale drafts, but never one that is running (conditional on status)
   const { data: drafts } = await sb.from('drafts').select('division, status, current_pick');
@@ -651,7 +668,8 @@ async function startNewSeason() {
   await loadAllData();
   renderCommissioner();
   try { renderStandings(); } catch (e) {}
-  alert('New season started. Now set who is playing and their divisions under Season Lineup, then schedule the draft.');
+  alert('New season started. Now set who is playing and their divisions under Season Lineup, then schedule the draft.' +
+    (problems.length ? '\n\nSome items could not be cleared:\n' + problems.join('\n') : ''));
 }
 
 function renderSeasonLineup() {

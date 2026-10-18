@@ -974,7 +974,7 @@ async function addLeagueTeam() {
   const pin = (document.getElementById('season-add-pin')?.value || '').trim().toLowerCase();
   const division = document.getElementById('season-add-div')?.value || null;
   if (!name) return alert('Enter the owner name.');
-  if (!pin || pin.length < 4 || pin.length > 10 || !/^[a-z0-9]+$/.test(pin)) return alert('PIN must be 4–10 letters or numbers only.');
+  if (!pin || pin.length < 4 || pin.length > 10 || !/^[a-z0-9]+$/.test(pin)) return alert('PIN must be ' + PIN_RULE_TEXT);
   const blocked = await draftBlocksLineupChange();
   if (blocked) return alert(blocked);
   if (!confirm(`Add ${name} (${division ? divisionLabel(division) : 'no division'}) with PIN "${pin}"?\n\nGive them the PIN privately — they can change it under My Team.`)) return;
@@ -984,7 +984,7 @@ async function addLeagueTeam() {
     p_token: token, p_name: name, p_pin: pin, p_division: division, p_max_roster: getSeasonRosterSpots()
   });
   if (error) return alert(isAuthRpcMissing(error) ? LOGIN_RPC_MISSING_MSG : 'Could not add team: ' + error.message);
-  if (!res || !res.ok) return alert(res && res.code === 'division_check' ? DIVISION_MIGRATION_MSG : 'Could not add team: ' + ((res && res.message) || 'unknown error'));
+  if (!res || !res.ok) return alert(res && res.code === 'division_check' ? DIVISION_MIGRATION_MSG : 'Could not add team: ' + pinProblemText(res, 'unknown error'));
   document.getElementById('season-add-name').value = '';
   document.getElementById('season-add-pin').value = '';
   await loadAllData();
@@ -1013,14 +1013,14 @@ async function commishResetPin() {
   const msg = document.getElementById('reset-pin-msg');
   const say = (t, cls) => { if (msg) { msg.textContent = t; msg.className = 'text-sm mt-2 ' + cls; } };
   if (!team) return say('Choose a team.', 'text-red-400');
-  if (!pin || pin.length < 4 || pin.length > 10 || !/^[a-z0-9]+$/.test(pin)) return say('PIN must be 4\u201310 letters or numbers only.', 'text-red-400');
+  if (!pin || pin.length < 4 || pin.length > 10 || !/^[a-z0-9]+$/.test(pin)) return say('PIN must be ' + PIN_RULE_TEXT, 'text-red-400');
   const name = data.users[team]?.name || team;
   if (!confirm(`Set a new PIN for ${name}?\n\nTheir old PIN stops working and they are logged out everywhere. Give them the new PIN privately; they can change it under My Team.`)) return;
   const token = getSessionToken();
   if (!token) return say('Your login has expired. Log out and log in again.', 'text-red-400');
   const { data: res, error } = await window.supabaseClient.rpc('commish_set_team_pin', { p_token: token, p_team: team, p_new_pin: pin });
   if (error) return say(isAuthRpcMissing(error) ? LOGIN_RPC_MISSING_MSG : 'Could not reset: ' + error.message, 'text-red-400');
-  if (!res || !res.ok) return say((res && res.message) || 'Could not reset the PIN.', 'text-red-400');
+  if (!res || !res.ok) return say(pinProblemText(res, 'Could not reset the PIN.'), 'text-red-400');
   if (inp) inp.value = '';
   say('New PIN set for ' + name + '.', 'text-emerald-400');
 }
@@ -3890,9 +3890,16 @@ window.showTradeModal = showTradeModal;
 
 
 // Shown once after logging in with a PIN that is still the team's public ID.
+// Server rule (aew_new_pin_problem) rejects any team's ID, owner name or team
+// name, ignoring case, spaces and symbols. Keep PIN_RULE_TEXT in sync with it.
+const PIN_RULE_TEXT = '4\u201310 letters or numbers, and not any team\u2019s ID, team name or owner name.';
+function pinProblemText(res, fallback) {
+  if (res && res.code === 'public_pin') return 'That PIN is a team ID, team name or owner name that other league members can see. Please pick a private PIN.';
+  return (res && res.message) || fallback;
+}
 function nudgePinChange() {
   if (!currentUser || isReadOnlyViewer()) return;
-  if (confirm('Your PIN is the same as your team ID, which other people can see in the app.\n\nChoose a new PIN that only you know? (My Team \u2192 Change Your PIN)')) {
+  if (confirm('Your PIN is also your team\u2019s ID in the app, so other league members can see it.\n\nPlease pick a new private PIN. Go to My Team \u2192 Change Your PIN now?')) {
     try { showTab('myteam'); } catch (e) {}
     setTimeout(() => document.getElementById('new-pin-input')?.focus(), 200);
   }
@@ -3905,14 +3912,14 @@ async function changePin() {
   const say = (t, cls) => { if (msg) { msg.textContent = t; msg.className = 'text-sm mt-2 ' + cls; } };
   if (guardReadOnly('change a PIN')) return;
 
-  if (!newPin || newPin.length < 4 || newPin.length > 10 || !/^[a-z0-9]+$/.test(newPin)) return say('PIN must be 4\u201310 letters or numbers only', 'text-red-400');
+  if (!newPin || newPin.length < 4 || newPin.length > 10 || !/^[a-z0-9]+$/.test(newPin)) return say('PIN must be ' + PIN_RULE_TEXT, 'text-red-400');
   if (newPin !== confirmPin) return say('PINs do not match', 'text-red-400');
   const token = getSessionToken();
   if (!token) return say('Your login has expired. Log out and log in again.', 'text-red-400');
 
   const { data: res, error } = await window.supabaseClient.rpc('change_my_pin', { p_token: token, p_new_pin: newPin });
   if (error) return say(isAuthRpcMissing(error) ? LOGIN_RPC_MISSING_MSG : 'Error changing PIN: ' + (error.message || error), 'text-red-400');
-  if (!res || !res.ok) return say((res && res.message) || 'Could not change the PIN.', res && res.code === 'same_pin' ? 'text-yellow-400' : 'text-red-400');
+  if (!res || !res.ok) return say(pinProblemText(res, 'Could not change the PIN.'), res && res.code === 'same_pin' ? 'text-yellow-400' : 'text-red-400');
 
   document.getElementById('new-pin-input').value = '';
   document.getElementById('confirm-pin-input').value = '';

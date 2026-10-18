@@ -618,6 +618,23 @@ function isSharedRosterPool() {
   return data.rosterMode === 'shared';
 }
 
+// ----- Roster spots per team (chosen at Start New Season) -----
+// Stored in settings 'roster_spots'. It is each team's base roster cap AND the number
+// of draft rounds. Missing (the league before its first Start New Season) = 8, which
+// is exactly the old hard-coded behavior.
+const DEFAULT_ROSTER_SPOTS = 8;
+const MAX_ROSTER_SPOTS = 30;
+function parseRosterSpots(v) {
+  const n = Number(String(v ?? '').trim());
+  return Number.isInteger(n) && n >= 1 && n <= MAX_ROSTER_SPOTS ? n : null;
+}
+function getSeasonRosterSpots() {
+  return data.rosterSpots || DEFAULT_ROSTER_SPOTS;
+}
+function getDraftRounds() {
+  return getSeasonRosterSpots();
+}
+
 /** Wrestlers already drafted that this division's draft must skip */
 async function loadDraftTaken(division, divisionPicks) {
   const norm = (w) => String(w || '').toLowerCase().trim();
@@ -706,6 +723,20 @@ async function draftBlocksLineupChange() {
   return null;
 }
 
+async function archiveWrestlerPointsForNewSeason() {
+  const sb = window.supabaseClient;
+  const { data: rows, error } = await sb.from('wrestler_points').select('name, points');
+  if (error) return { error: error.message };
+  if (!(rows || []).some(r => Number(r.points))) return { skipped: true };
+  const now = new Date().toISOString();
+  const upd = rows.map(r => ({ name: r.name, prior_points: Number(r.points) || 0, points: 0, updated_at: now }));
+  const { error: uErr } = await sb.from('wrestler_points').upsert(upd, { onConflict: 'name' });
+  if (uErr) return { error: uErr.message + (String(uErr.message).includes('prior_points') ? ' (apply the prior_points migration first)' : '') };
+  data.priorPoints = {}; data.wrestlerPoints = {};
+  upd.forEach(r => { const k = r.name.toLowerCase().trim(); data.priorPoints[k] = r.prior_points; data.wrestlerPoints[k] = 0; });
+  return { ok: true, saved: upd.length };
+}
+
 async function startNewSeason() {
   if (guardReadOnly('start a new season')) return;
   if (!isCommissioner()) return alert('Only the commissioner can start a new season.');
@@ -726,45 +757,73 @@ async function startNewSeason() {
     rosterMode = document.querySelector('input[name="nsn-roster-mode"]:checked')?.value || '';
     if (rosterMode !== 'shared' && rosterMode !== 'separate') return alert('Choose the AEW roster: one shared roster, or each division gets its own.');
   }
+  const spotsRaw = (document.getElementById('nsn-roster-spots')?.value || '').trim();
+  const spots = parseRosterSpots(spotsRaw);
+  if (!spots) return alert('Enter how many roster spots each team gets (a whole number from 1 to ' + MAX_ROSTER_SPOTS + '). It is also the number of draft rounds.');
   const divProblem = await ensureDivisionsAllowed(slugs);
   if (divProblem) return alert(divProblem);
   const moved = teams.filter(([, u]) => u.division && !slugs.includes(u.division));
+  // Pool-size check (warning only; the Season Lineup is set after this step)
+  const playing = teams.filter(([, u]) => u.division && slugs.includes(u.division) || (setup.count === 1 && u.division));
+  const poolSize = (data.masterRoster || []).length;
+  let poolWarn = '';
+  if (rosterMode === 'shared') {
+    const need = playing.length * spots;
+    if (poolSize < need) poolWarn = `\n\u26a0\ufe0f Draft pool has ${poolSize} wrestlers but ${playing.length} teams \u00d7 ${spots} spots needs ${need} (one shared roster). Add wrestlers or lower the spots before the draft.\n`;
+  } else {
+    const per = {};
+    playing.forEach(([, u]) => { per[u.division] = (per[u.division] || 0) + 1; });
+    const biggest = Math.max(0, ...Object.values(per));
+    if (poolSize < biggest * spots) poolWarn = `\n\u26a0\ufe0f Draft pool has ${poolSize} wrestlers but the biggest division needs ${biggest} teams \u00d7 ${spots} spots = ${biggest * spots}. Add wrestlers or lower the spots before the draft.\n`;
+  }
+  const anyPoints = Object.values(data.wrestlerPoints || {}).some(v => Number(v));
 
   if (!confirm('Start a NEW SEASON?\n\n' +
     `• Divisions: ${setup.count === 1 ? '1 (Overall only)' : setup.names.map(n => n.name).join(', ')}\n` +
     `• AEW roster: ${rosterMode === 'shared' ? 'ONE shared roster \u2014 each wrestler can be on only one team in the whole league' : 'each division gets its own full AEW roster'}\n` +
     (moved.length ? `• ${setup.count === 1 ? 'Moved into the one division' : 'Set to Not playing (their division is gone)'}: ${moved.map(([, u]) => u.name).join(', ')}\n` : '') +
     `• Un-purge every team${purged.length ? ' (' + purged.join(', ') + ')' : ''}\n` +
+    `• Roster spots: ${spots} per team for every team (any Foreign Object extra spot ends). The draft will have ${spots} rounds.\n` +
     '• Team standings points and last-show change go to 0\n' +
-    '• Roster size goes back to 8 (Foreign Object 9th spot ends)\n' +
+    (anyPoints
+      ? '• Each wrestler\u2019s season points are saved as their PRIOR-SEASON points (used to rank the draft pool), then season points start at 0\n'
+      : '• Wrestler season points are already all 0, so the saved prior-season points are left as they are\n') +
     '• Last season\u2019s finished drafts are cleared (picks, order, lock) so a new Draft Fight can run\n' +
     '• All held Foreign Objects are removed, plus armed FO effects and the last Wheel Of Boom spin\n' +
     '• Open trade offers are cancelled (finished trade history stays)\n' +
     '• All waiver claims are cleared and the waiver deadline is removed\n\n' +
     'Record the Fantasy League Champion first — final standings points are wiped.\n' +
-    'Rosters are NOT touched (the draft overwrites them). Next: set teams below, then schedule the draft and run the Draft Fight.')) return;
+    'Rosters are NOT touched (the draft overwrites them). Next: set teams below, then schedule the draft and run the Draft Fight.' + poolWarn)) return;
 
   const sb = window.supabaseClient;
-  // Save divisions + roster mode first (key-value settings, no schema change)
-  for (const row of [{ key: 'division_setup', value: JSON.stringify(setup) }, { key: 'roster_mode', value: rosterMode }]) {
+  const problems = [];
+  // Save divisions + roster mode + roster spots first (key-value settings, no schema change)
+  for (const row of [{ key: 'division_setup', value: JSON.stringify(setup) }, { key: 'roster_mode', value: rosterMode }, { key: 'roster_spots', value: String(spots) }]) {
     const { error: sErr } = await sb.from('settings').upsert(row);
     if (sErr) return alert('Could not save ' + row.key + ': ' + sErr.message + '\nNothing else was changed.');
   }
   data.divisionSetup = setup;
   data.rosterMode = rosterMode;
+  data.rosterSpots = spots;
   for (const [pin] of moved) {
     const { error: mErr } = await sb.from('teams').update({ division: setup.count === 1 ? slugs[0] : null }).eq('pin', pin);
     if (mErr) return alert(isDivisionCheckError(mErr) ? DIVISION_MIGRATION_MSG : 'Could not move team: ' + mErr.message);
   }
 
   const { error } = await sb.from('teams')
-    .update({ purged: false, points: 0, last_delta: null, max_roster: 8 })
+    .update({ purged: false, points: 0, last_delta: null, max_roster: spots })
     .neq('pin', ''); // all teams
   if (error) return alert('Could not reset teams: ' + error.message);
 
+  // Wrestler points: last season's totals become prior-season points (draft pool
+  // ranking), then the new season starts at 0. One upsert statement = all or nothing.
+  // Skipped when every wrestler is already at 0 (e.g. pressed twice) so a second
+  // press can't wipe the saved prior-season points.
+  const archive = await archiveWrestlerPointsForNewSeason();
+  if (archive.error) problems.push('wrestler points: ' + archive.error);
+
   // Season-level FO / trade / waiver state. History (fo_history, finished trades,
   // waiver_reports) stays. Autopick lists, trade blocks and the Purge date stay.
-  const problems = [];
   const step = async (label, q) => { const { error: e } = await q; if (e) problems.push(label + ': ' + e.message); };
   await step('Foreign Objects', sb.from('foreign_objects').delete().gt('id', 0));
   await step('armed FO effects', sb.from('settings').delete().in('key', ['ppv_week_pin', 'waiver_disrupter_pin']));
@@ -849,7 +908,7 @@ async function addLeagueTeam() {
   if (blocked) return alert(blocked);
   if (!confirm(`Add ${name} (${division ? divisionLabel(division) : 'no division'}) with PIN "${pin}"?\n\nGive them the PIN privately — they can change it under My Team.`)) return;
   const { error } = await window.supabaseClient.from('teams').insert({
-    pin, name, division, is_commissioner: false, max_roster: 8, roster: [], points: 0, last_delta: null, purged: false
+    pin, name, division, is_commissioner: false, max_roster: getSeasonRosterSpots(), roster: [], points: 0, last_delta: null, purged: false
   });
   if (error) return alert(isDivisionCheckError(error) ? DIVISION_MIGRATION_MSG : 'Could not add team: ' + error.message);
   document.getElementById('season-add-name').value = '';
@@ -1449,6 +1508,12 @@ async function loadAllData() {
   data.waiverDeadline = deadlineRow ? deadlineRow.value : null;
   const modeRow = (settings || []).find(s => s.key === 'roster_mode');
   data.rosterMode = modeRow && modeRow.value === 'shared' ? 'shared' : 'separate';
+  const spotsRow = (settings || []).find(s => s.key === 'roster_spots');
+  data.rosterSpots = spotsRow ? parseRosterSpots(spotsRow.value) : null;
+  try {
+    document.querySelectorAll('[data-roster-spots]').forEach(el => { el.textContent = String(getSeasonRosterSpots()); });
+    document.querySelectorAll('[data-roster-spots-bonus]').forEach(el => { el.textContent = String(getSeasonRosterSpots() + 1); });
+  } catch (e) {}
   data.divisionSetup = null;
   const divRow = (settings || []).find(s => s.key === 'division_setup');
   if (divRow && divRow.value) {
@@ -1919,7 +1984,7 @@ function renderStandings() {
             <span class="font-semibold truncate inline-block max-w-full ${t.purged ? 'line-through text-red-400/80' : ''}" title="Owner: ${teamOwnerLabel(t.pin)}">${teamDisplayName(t.pin)}</span>
             ${teamDisplayName(t.pin) !== teamOwnerLabel(t.pin) ? `<span class="block text-[10px] text-gray-500 truncate" title="Owner: ${teamOwnerLabel(t.pin)}">${teamOwnerLabel(t.pin)}</span>` : ''}
           </span>${t.purged ? '<span class="text-[10px] font-bold uppercase tracking-wide text-red-500 border border-red-500/60 rounded px-1.5 py-0.5 ml-1.5 flex-shrink-0">PURGED</span>' : ''}${t.purged ? '' : champCrown(t.pin)}
-          ${t.maxRoster > 8 ? '<span class="text-xs bg-emerald-900 text-emerald-300 px-1.5 py-0.5 rounded flex-shrink-0">9</span>' : ''}
+          ${t.maxRoster > getSeasonRosterSpots() ? '<span class="text-xs bg-emerald-900 text-emerald-300 px-1.5 py-0.5 rounded flex-shrink-0">' + t.maxRoster + '</span>' : ''}
         </div>
         <div class="flex items-center gap-1 flex-shrink-0 ml-2">
           <span class="font-bold text-lg">${t.points}</span>
@@ -1987,7 +2052,7 @@ function renderStandings() {
           </span>
           ${badge}
           ${t.purged ? '<span class="text-[10px] font-bold uppercase tracking-wide text-red-500 border border-red-500/60 rounded px-1.5 py-0.5 flex-shrink-0">PURGED</span>' : ''}${t.purged ? '' : champCrown(t.pin)}
-          ${t.maxRoster > 8 ? '<span class="text-xs bg-emerald-900 text-emerald-300 px-1.5 py-0.5 rounded flex-shrink-0">9</span>' : ''}
+          ${t.maxRoster > getSeasonRosterSpots() ? '<span class="text-xs bg-emerald-900 text-emerald-300 px-1.5 py-0.5 rounded flex-shrink-0">' + t.maxRoster + '</span>' : ''}
         </div>
         <div class="flex items-center gap-1 flex-shrink-0 ml-2">
           <span class="font-bold text-lg">${t.points}</span>
@@ -4005,10 +4070,12 @@ async function applyWheelSegment(pin, result) {
     return (u.name || pin) + ' +' + result.value + ' points';
   }
   if (result.effect === 'roster9') {
-    const { error } = await window.supabaseClient.from('teams').update({ max_roster: 9 }).eq('pin', pin);
-    if (error) throw new Error('Could not set roster size to 9: ' + (error.message || error));
-    u.maxRoster = 9;
-    return (u.name || pin) + ' roster size set to 9. Commissioner can add the 9th name under Edit Team Rosters.';
+    // +1 spot on top of the season's roster size (8 + 1 = 9 until a season sets another size)
+    const bonus = getSeasonRosterSpots() + 1;
+    const { error } = await window.supabaseClient.from('teams').update({ max_roster: bonus }).eq('pin', pin);
+    if (error) throw new Error('Could not set roster size to ' + bonus + ': ' + (error.message || error));
+    u.maxRoster = bonus;
+    return (u.name || pin) + ' roster size set to ' + bonus + '. Commissioner can add the extra name under Edit Team Rosters.';
   }
   if (result.effect === 'steal5') {
     const others = Object.entries(data.users)
@@ -4188,7 +4255,8 @@ const _origRenderCommFO = typeof renderCommissioner === 'function' ? renderCommi
 
 
 // ---------- Draft Room ----------
-const DRAFT_ROUNDS = 8;
+// Draft rounds = roster spots per team (settings 'roster_spots', default 8). The
+// database function make_draft_pick() reads the same setting.
 
 async function loadDraftState(division) {
   const { data: draft } = await window.supabaseClient.from('drafts').select('*').eq('division', division).maybeSingle();
@@ -4594,6 +4662,18 @@ async function startDraft(division) {
   if (!isDraftOrderLocked(draft)) return alert('Run the Draft Fight and lock its result first. The locked Draft Fight order is the draft order.');
   if (draft.status === 'active' || draft.status === 'paused') return alert('This draft is already ' + draft.status + '. Use Pause / Resume.');
   if (draft.status === 'complete') return alert('This draft is complete. Set a new schedule date to reset it for next season, then run a new Draft Fight.');
+  // Enough wrestlers for every team to fill every roster spot? (warning only)
+  try {
+    const rounds = getDraftRounds();
+    const poolSize = (data.masterRoster || []).length;
+    let need = draft.order_pins.length * rounds, scope = 'this division';
+    if (isSharedRosterPool()) {
+      const { data: all } = await window.supabaseClient.from('drafts').select('division, order_pins');
+      need = (all || []).reduce((n, x) => n + ((x.order_pins || []).length * rounds), 0) || need;
+      scope = 'the whole league (one shared AEW roster)';
+    }
+    if (poolSize < need && !confirm(`Heads up: the draft pool has ${poolSize} wrestlers but ${scope} needs ${need} (${rounds} roster spots per team). The draft will run out before every roster is full.\n\nStart anyway?`)) return;
+  } catch (e) { console.warn('pool size check', e); }
   // Clear old picks
   await window.supabaseClient.from('draft_picks').delete().eq('division', division);
   await window.supabaseClient.from('drafts').update({
@@ -4774,7 +4854,7 @@ async function renderDraft() {
           <span class="font-bold">${divisionLabel(focusDiv)} Draft</span>
           <span class="ml-2 text-sm px-2 py-0.5 rounded ${d.status === 'active' ? 'bg-emerald-900 text-emerald-300' : d.status === 'complete' ? 'bg-blue-900 text-blue-300' : 'bg-gray-800 text-gray-400'}">${d.status}</span>
         </div>
-        <div class="text-sm text-gray-400">Pick ${(d.current_pick || 0) + 1} of ${((d.order_pins || []).length * DRAFT_ROUNDS) || '?'}</div>
+        <div class="text-sm text-gray-400">Pick ${(d.current_pick || 0) + 1} of ${((d.order_pins || []).length * getDraftRounds()) || '?'}</div>
       </div>
       ${d.scheduled_at ? `<div class="text-sm text-blue-300 mt-2">Scheduled: ${new Date(d.scheduled_at).toLocaleString()}</div>` : ''}
       ${orderNames ? `<div class="text-xs text-gray-500 mt-1">Order: ${orderNames}</div>` : ''}
@@ -4794,7 +4874,7 @@ async function renderDraft() {
       const pin = getSnakePin(d.order_pins, d.current_pick || 0);
       const name = data.users[pin]?.name || pin;
       const isMyTurn = pin === currentUser;
-      const available = data.masterRoster.filter(w => !takenNow.has(w.toLowerCase().trim())).sort((a,b) => getDraftPts(b) - getDraftPts(a) || a.localeCompare(b));
+      const available = sortDraftPool(data.masterRoster.filter(w => !takenNow.has(w.toLowerCase().trim())));
 
       const canPick = isMyTurn || isCommish;
       pickArea.innerHTML = `
@@ -4809,6 +4889,7 @@ async function renderDraft() {
             <button type="button" id="draft-submit-pick" class="mt-3 w-full sm:w-auto bg-aew-gold text-black font-bold px-8 py-3 rounded-lg text-base disabled:opacity-40 disabled:cursor-not-allowed" disabled>Submit Pick</button>
           </div>
           <input id="draft-pool-filter" type="search" placeholder="Search pool…" class="w-full mb-2 bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm" />
+          ${draftPoolSortToggleHtml()}
           <div id="draft-pool-grid" class="max-h-80 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
             ${available.slice(0, 200).map(w => `
               <div class="draft-pick-btn text-left text-sm px-2 py-2 rounded bg-black/50 hover:bg-gray-800 border border-gray-800 flex items-center gap-2 cursor-pointer" draggable="true" data-name="${String(w).replace(/"/g, '&quot;')}">
@@ -4829,6 +4910,7 @@ async function renderDraft() {
         const zone = document.getElementById('draft-drop-zone');
         const selectWrestler = (w) => {
           selected = w;
+          draftPendingSelection = w ? { key: focusDiv + ':' + (d.current_pick || 0), name: w } : null;
           if (label) label.textContent = w;
           if (submit) submit.disabled = !w;
           pickArea.querySelectorAll('.draft-pick-btn').forEach(el => {
@@ -4836,6 +4918,7 @@ async function renderDraft() {
             el.classList.toggle('bg-aew-gold/10', el.dataset.name === w);
           });
         };
+        const pickKey = focusDiv + ':' + (d.current_pick || 0);
         const commitPick = () => {
           if (!selected) return;
           if (!confirm('Submit pick: ' + selected + '?')) return;
@@ -4867,12 +4950,15 @@ async function renderDraft() {
           });
         });
         document.getElementById('draft-autopick-btn')?.addEventListener('click', () => tryAutopick(focusDiv));
+        wireDraftPoolSortToggle(pickArea, () => renderDraft());
+        if (draftPendingSelection && draftPendingSelection.key === pickKey && available.includes(draftPendingSelection.name)) {
+          selectWrestler(draftPendingSelection.name);
+        }
       }
     } else if (d?.status === 'complete') {
       pickArea.innerHTML = '<div class="text-center text-emerald-400 py-4 font-semibold">Draft complete</div>';
     } else {
-      const pool = (data.masterRoster || []).filter(w => !takenNow.has(w.toLowerCase().trim()))
-        .sort((a,b) => getDraftPts(b) - getDraftPts(a) || a.localeCompare(b));
+      const pool = sortDraftPool((data.masterRoster || []).filter(w => !takenNow.has(w.toLowerCase().trim())));
       const orderReady = d?.order_pins?.length;
       const when = d?.scheduled_at ? new Date(d.scheduled_at) : null;
       pickArea.innerHTML = `
@@ -4884,7 +4970,8 @@ async function renderDraft() {
             ? `<div class="text-xs text-gray-400 mt-2">Order locked: ${(d.order_pins || []).map(p => data.users[p]?.name || p).join(' → ')}</div>`
             : `<div class="text-xs text-gray-500 mt-2">Draft order is set when the commissioner runs the Draft Fight and locks the result.</div>`}
         </div>
-        <div class="text-xs text-gray-400 mb-2">Draft pool (highest prior-season points first) — prepare your board</div>
+        <div class="text-xs text-gray-400 mb-2">Draft pool \u2014 prepare your board${pool.length > 80 ? ' (first 80 shown)' : ''}</div>
+        ${draftPoolSortToggleHtml()}
         <div class="max-h-64 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-2">
           ${pool.slice(0, 80).map(w => `
             <div class="text-left text-sm px-2 py-2 rounded bg-black/50 border border-gray-800 flex items-center gap-2">
@@ -4895,6 +4982,7 @@ async function renderDraft() {
           `).join('') || '<p class="text-gray-500 text-sm">No pool uploaded yet</p>'}
         </div>
       `;
+      wireDraftPoolSortToggle(pickArea, () => renderDraft());
     }
   }
 
@@ -5027,7 +5115,8 @@ async function loadWrestlerPoints() {
       if (!r || !r.name) return;
       const k = String(r.name).toLowerCase().trim();
       next[k] = Number(r.points) || 0;
-      prior[k] = Number(r.prior_points) || 0;
+      // null / missing = no prior-season number recorded for this wrestler
+      prior[k] = (r.prior_points === null || r.prior_points === undefined || r.prior_points === '') ? null : (Number(r.prior_points) || 0);
     });
     data.wrestlerPoints = next;
     data.priorPoints = prior;
@@ -5039,17 +5128,56 @@ async function loadWrestlerPoints() {
   }
 }
 
-function getPriorPts(name) {
-  if (!data.priorPoints) return 0;
-  return data.priorPoints[name.toLowerCase().trim()] ?? 0;
+/** True once the league has real prior-season numbers (any wrestler with a non-zero
+ *  prior). Before that, an all-zero / empty prior column means "never recorded". */
+function priorPointsPopulated() {
+  return Object.values(data.priorPoints || {}).some(v => v !== null && v !== undefined && Number(v) !== 0);
 }
 
-/** Points shown in Draft room: prior season if set, else current season total */
+/** Prior-season points, or null when none are recorded for this wrestler.
+ *  Rule (same in make_draft_pick): a stored number counts — including a real 0 —
+ *  once the league has prior-season numbers at all. Null/missing, or an all-zero
+ *  column that was never filled in, means "not recorded". */
+function getPriorPts(name) {
+  if (!data.priorPoints) return null;
+  const v = data.priorPoints[String(name).toLowerCase().trim()];
+  if (v === null || v === undefined) return null;
+  if (Number(v) === 0 && !priorPointsPopulated()) return null;
+  return Number(v) || 0;
+}
+
+/** Points shown / ranked in the Draft room: prior season when recorded, else current season total */
 function getDraftPts(name) {
   const p = getPriorPts(name);
-  if (p) return p;
+  if (p !== null) return p;
   return getWrestlerPts(name);
 }
+
+// ----- Draft pool sort (each owner's choice, remembered on this device) -----
+const DRAFT_POOL_SORT_KEY = 'aew_draft_pool_sort';
+function getDraftPoolSort() {
+  try { return localStorage.getItem(DRAFT_POOL_SORT_KEY) === 'az' ? 'az' : 'points'; } catch (e) { return 'points'; }
+}
+function setDraftPoolSort(v) {
+  try { localStorage.setItem(DRAFT_POOL_SORT_KEY, v === 'az' ? 'az' : 'points'); } catch (e) {}
+}
+function sortDraftPool(list, mode = getDraftPoolSort()) {
+  const byName = (a, b) => String(a).localeCompare(String(b), undefined, { sensitivity: 'base' });
+  return list.slice().sort(mode === 'az' ? byName : ((a, b) => getDraftPts(b) - getDraftPts(a) || byName(a, b)));
+}
+function draftPoolSortToggleHtml() {
+  const mode = getDraftPoolSort();
+  const btn = (v, label) => `<button type="button" data-draft-sort="${v}" class="px-2.5 py-1 rounded ${mode === v ? 'bg-aew-gold text-black font-bold' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'}">${label}</button>`;
+  return `<div class="flex items-center gap-1 text-xs mb-2"><span class="text-gray-400 mr-1">Sort:</span>${btn('points', 'Prior-season points (high \u2192 low)')}${btn('az', 'A\u2013Z')}</div>`;
+}
+function wireDraftPoolSortToggle(root, onChange) {
+  (root || document).querySelectorAll('[data-draft-sort]').forEach(b => b.addEventListener('click', () => {
+    if (b.dataset.draftSort === getDraftPoolSort()) return;
+    setDraftPoolSort(b.dataset.draftSort);
+    onChange();
+  }));
+}
+let draftPendingSelection = null; // keeps the tapped wrestler when the pool is re-sorted
 
 async function savePriorPointsBulk(updates) {
   if (guardReadOnly('update points')) return { ok: false, error: 'View only', saved: 0 };
@@ -5089,7 +5217,7 @@ async function savePriorPointsBulk(updates) {
   }
   rows.forEach(r => {
     data.priorPoints = data.priorPoints || {};
-    data.priorPoints[r.name.toLowerCase().trim()] = r.prior_points;
+    data.priorPoints[r.name.toLowerCase().trim()] = Number(r.prior_points) || 0;
   });
   return { ok: true, saved: rows.length };
 }

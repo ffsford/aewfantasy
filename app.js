@@ -5284,10 +5284,12 @@ async function loadWrestlerPoints() {
     }
     const next = {};
     const prior = {};
+    data.wrestlerPointNames = {};
     (rows || []).forEach(r => {
       if (!r || !r.name) return;
       const k = String(r.name).toLowerCase().trim();
       next[k] = Number(r.points) || 0;
+      (data.wrestlerPointNames = data.wrestlerPointNames || {})[k] = String(r.name).trim();
       // null / missing = no prior-season number recorded for this wrestler
       prior[k] = (r.prior_points === null || r.prior_points === undefined || r.prior_points === '') ? null : (Number(r.prior_points) || 0);
     });
@@ -5398,6 +5400,128 @@ async function savePriorPointsBulk(updates) {
 function getWrestlerPts(name) {
   if (!data.wrestlerPoints) return 0;
   return data.wrestlerPoints[name.toLowerCase().trim()] ?? 0;
+}
+
+// ----- Wrestler name matching: case / spacing / apostrophes / known aliases -----
+// Aliases live in settings.wrestler_aliases as JSON { "alternate spelling": "Canonical Name" }.
+function normWrestlerName(n) {
+  return String(n || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u2018\u2019\u02bc`\u00b4]/g, "'").replace(/[.]/g, '')
+    .replace(/\s+/g, ' ').trim().toLowerCase();
+}
+async function loadWrestlerAliases() {
+  try {
+    const { data: row } = await window.supabaseClient.from('settings').select('value').eq('key', 'wrestler_aliases').maybeSingle();
+    const raw = row && row.value ? JSON.parse(row.value) : {};
+    const map = {};
+    Object.entries(raw || {}).forEach(([a, c]) => { if (a && c) map[normWrestlerName(a)] = String(c); });
+    data.wrestlerAliases = map;
+  } catch (e) {
+    console.warn('wrestler aliases load', e);
+    if (!data.wrestlerAliases) data.wrestlerAliases = {};
+  }
+  return data.wrestlerAliases;
+}
+async function saveWrestlerAliases(pairs) { // pairs = [{alias, canonical}]
+  if (!pairs.length) return { ok: true };
+  const { data: row, error: rErr } = await window.supabaseClient.from('settings').select('value').eq('key', 'wrestler_aliases').maybeSingle();
+  if (rErr) return { ok: false, error: rErr.message };
+  let raw = {};
+  try { raw = row && row.value ? JSON.parse(row.value) : {}; } catch (e) { raw = {}; }
+  pairs.forEach(p => { raw[String(p.alias).trim()] = p.canonical; });
+  const { error } = await window.supabaseClient.from('settings').upsert({ key: 'wrestler_aliases', value: JSON.stringify(raw) });
+  if (error) return { ok: false, error: error.message };
+  await loadWrestlerAliases();
+  return { ok: true };
+}
+/** Every wrestler name the league already knows (points table, master list, rosters). norm -> display name */
+function knownWrestlerNames() {
+  const out = new Map();
+  const add = (n) => { const k = normWrestlerName(n); if (k && !out.has(k)) out.set(k, String(n).trim()); };
+  Object.values(data.users || {}).forEach(u => (u && u.roster || []).forEach(add)); // roster spelling wins
+  (data.masterRoster || []).forEach(add);
+  Object.keys(data.wrestlerPointNames || {}).forEach(k => add(data.wrestlerPointNames[k]));
+  return out;
+}
+/** Canonical name for what was typed, or null if no wrestler matches. */
+function resolveWrestlerName(typed) {
+  const known = knownWrestlerNames();
+  const k = normWrestlerName(typed);
+  if (known.has(k)) return known.get(k);
+  const alias = (data.wrestlerAliases || {})[k];
+  if (alias) return known.get(normWrestlerName(alias)) || alias;
+  return null;
+}
+function wrestlerNameSuggestions(typed, limit = 5) {
+  const t = normWrestlerName(typed).replace(/[^a-z0-9 ]/g, '');
+  const tw = t.split(' ').filter(Boolean);
+  const bigrams = (x) => { const s = new Set(); for (let i = 0; i < x.length - 1; i++) s.add(x.slice(i, i + 2)); return s; };
+  const tb = bigrams(t.replace(/ /g, ''));
+  const scored = [...knownWrestlerNames().entries()].map(([k, name]) => {
+    const c = k.replace(/[^a-z0-9 ]/g, ''); const cb = bigrams(c.replace(/ /g, ''));
+    let inter = 0; tb.forEach(b => { if (cb.has(b)) inter++; });
+    let score = (2 * inter) / ((tb.size + cb.size) || 1);
+    const cw = c.split(' ');
+    if (tw.some(w => w.length > 2 && cw.includes(w))) score += 0.35;
+    if (c.startsWith(t) || t.startsWith(c)) score += 0.2;
+    return { name, score };
+  }).filter(x => x.score > 0.3).sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map(x => x.name);
+}
+/**
+ * Maps typed names to wrestlers. If any are unknown, shows Devin a chooser inside `host`
+ * and resolves only when every name has an answer. Resolves to { map: {typed: canonical}, cancelled }.
+ * Nothing is saved by this function except optional remembered aliases.
+ */
+function resolveWrestlerNamesInteractive(typedNames, host) {
+  return new Promise((resolve) => {
+    const map = {}; const unknown = [];
+    [...new Set(typedNames.map(n => String(n).trim()).filter(Boolean))].forEach(n => {
+      const c = resolveWrestlerName(n);
+      if (c) map[n] = c; else unknown.push(n);
+    });
+    if (!unknown.length) return resolve({ map, cancelled: false });
+    if (!host) { alert('Unknown wrestler names: ' + unknown.join(', ')); return resolve({ map, cancelled: true }); }
+    const esc = (x) => String(x).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const all = [...knownWrestlerNames().values()].sort((a, b) => a.localeCompare(b));
+    const rows = unknown.map((n, i) => {
+      const sug = wrestlerNameSuggestions(n);
+      const opts = '<option value="">\u2014 choose \u2014</option>' +
+        (sug.length ? '<optgroup label="Likely matches">' + sug.map(s => `<option value="w:${esc(s)}">${esc(s)}</option>`).join('') + '</optgroup>' : '') +
+        `<option value="new">\u2795 Add as new wrestler: ${esc(n)}</option>` +
+        '<optgroup label="All wrestlers">' + all.map(s => `<option value="w:${esc(s)}">${esc(s)}</option>`).join('') + '</optgroup>';
+      return `<div class="flex flex-wrap items-center gap-2 py-1 border-b border-gray-800" data-unk="${i}">
+        <span class="font-bold text-white min-w-[10rem]">${esc(n)}</span>
+        <select class="wn-pick bg-black border border-gray-700 rounded px-2 py-1 text-sm">${opts}</select>
+        <label class="text-xs text-gray-300 flex items-center gap-1"><input type="checkbox" class="wn-remember" checked> remember this spelling</label></div>`;
+    }).join('');
+    host.className = 'text-sm text-yellow-300';
+    host.innerHTML = `<div class="font-bold mb-1">Nothing saved yet. These names don't match a wrestler \u2014 pick who each one is:</div>${rows}
+      <div class="mt-2 flex gap-2"><button type="button" class="wn-go bg-aew-gold text-black font-bold px-3 py-1 rounded" disabled>Continue and save</button>
+      <button type="button" class="wn-cancel bg-gray-700 px-3 py-1 rounded">Cancel</button></div>`;
+    const go = host.querySelector('.wn-go');
+    const picks = [...host.querySelectorAll('.wn-pick')];
+    const check = () => { go.disabled = picks.some(p => !p.value); };
+    picks.forEach(p => p.addEventListener('change', check));
+    host.querySelector('.wn-cancel').addEventListener('click', () => { host.textContent = 'Cancelled. Nothing was saved.'; host.className = 'text-sm text-gray-400'; resolve({ map, cancelled: true }); });
+    go.addEventListener('click', async () => {
+      if (picks.some(p => !p.value)) return;
+      const remember = [];
+      host.querySelectorAll('[data-unk]').forEach(div => {
+        const n = unknown[Number(div.dataset.unk)];
+        const v = div.querySelector('.wn-pick').value;
+        if (v === 'new') { map[n] = n; return; }
+        const canonical = v.slice(2);
+        map[n] = canonical;
+        if (div.querySelector('.wn-remember').checked && normWrestlerName(n) !== normWrestlerName(canonical)) remember.push({ alias: n, canonical });
+      });
+      if (remember.length) {
+        const r = await saveWrestlerAliases(remember);
+        if (!r.ok) console.warn('Could not remember aliases', r.error);
+      }
+      resolve({ map, cancelled: false });
+    });
+  });
 }
 
 async function saveWrestlerPointsBulk(updates) {
@@ -6405,7 +6529,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       await loadPortraits();
       showWrestlerSaveResult(msg, result, runOne);
     };
-    await runOne([{ name, points: pts }]);
+    await loadWrestlerAliases();
+    const res1 = await resolveWrestlerNamesInteractive([name], msg);
+    if (res1.cancelled) return;
+    await runOne([{ name: res1.map[name] || name, points: pts }]);
     document.getElementById('wp-name').value = '';
     document.getElementById('wp-points').value = '';
   });
@@ -6422,6 +6549,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
     if (!updates.length) return alert('No lines to save (format: Name 12)');
     const msg = document.getElementById('wp-msg');
+    await loadWrestlerAliases();
+    const parsedOk = updates.filter(u => !isNaN(u.points));
+    const res = await resolveWrestlerNamesInteractive(parsedOk.map(u => u.name), msg);
+    if (res.cancelled) return;
+    updates.forEach(u => { if (!isNaN(u.points) && res.map[u.name.trim()]) u.name = res.map[u.name.trim()]; });
     const run = async (list) => {
       if (msg) { msg.textContent = 'Saving ' + list.length + ' wrestlers...'; msg.className = 'text-sm text-yellow-400'; }
       const result = await saveWrestlerPointsBulk(list);
@@ -7191,6 +7323,19 @@ async function approveShowImport() {
   try {
     if (msg) msg.textContent = 'Applying scores…';
     const sb = window.supabaseClient;
+
+    // 0) every name must match a known wrestler (or Devin says "add as new") before anything saves
+    await loadWrestlerAliases();
+    const nameRes = await resolveWrestlerNamesInteractive(Object.keys(currentShowImport.pointsMap), msg);
+    if (nameRes.cancelled) return;
+    const remapped = {};
+    for (const [n, p] of Object.entries(currentShowImport.pointsMap)) {
+      const c = nameRes.map[String(n).trim()] || n;
+      if (remapped[c]) { remapped[c] = { ...remapped[c], total: (remapped[c].total || 0) + (p.total || 0) }; }
+      else remapped[c] = { ...p };
+    }
+    currentShowImport.pointsMap = remapped;
+    if (msg) msg.textContent = 'Applying scores\u2026';
 
     // 1) wrestler_points upsert add
     for (const [name, p] of Object.entries(currentShowImport.pointsMap)) {

@@ -5270,9 +5270,10 @@ async function loadWrestlerPoints() {
   try {
     // Try with prior_points; fall back if column missing
     let rows = null, error = null;
-    let res = await window.supabaseClient.from('wrestler_points').select('name, points, prior_points');
+    // Oldest first so, if two rows ever share a name (different capitals), the newest wins.
+    let res = await window.supabaseClient.from('wrestler_points').select('name, points, prior_points, updated_at').order('updated_at', { ascending: true, nullsFirst: true });
     if (res.error && String(res.error.message || '').toLowerCase().includes('prior_points')) {
-      res = await window.supabaseClient.from('wrestler_points').select('name, points');
+      res = await window.supabaseClient.from('wrestler_points').select('name, points, updated_at').order('updated_at', { ascending: true, nullsFirst: true });
     }
     rows = res.data; error = res.error;
     if (error) {
@@ -5400,61 +5401,69 @@ function getWrestlerPts(name) {
 }
 
 async function saveWrestlerPointsBulk(updates) {
-  // updates = [{name, points}, ...]
-  // Normalize: trim names, batch upsert with explicit conflict target
-  const rows = [];
-  const seen = new Map(); // lowercase -> final row (last wins)
+  // updates = [{name, points}, ...]. One bulk upsert, then re-read and compare every row.
+  // Returns { ok, saved, total, failed: [{name, points, reason}], error }
+  if (guardReadOnly('update points')) return { ok: false, error: 'View only', saved: 0, total: 0, failed: [] };
+  const sb = window.supabaseClient;
+  const failed = [];
+  const seen = new Map(); // lowercase -> row (last line wins)
   for (const u of updates) {
-    const name = (u.name || '').trim();
-    if (!name) continue;
+    const name = String(u.name || '').trim();
     const pts = parseInt(u.points, 10);
-    if (isNaN(pts)) continue;
-    seen.set(name.toLowerCase(), { name, points: pts, updated_at: new Date().toISOString() });
+    if (!name || isNaN(pts)) { failed.push({ name: name || String(u.raw || '(blank)'), points: u.points, reason: 'could not read this line' }); continue; }
+    seen.set(name.toLowerCase(), { name, points: pts });
   }
-  for (const row of seen.values()) rows.push(row);
-  if (!rows.length) return { ok: false, error: 'No valid updates', saved: 0 };
+  const want = [...seen.values()];
+  if (!want.length) return { ok: false, error: 'No valid updates', saved: 0, total: failed.length, failed };
 
-  // Prefer matching existing DB casing so we don't create duplicate keys
-  const existingByLower = {};
-  try {
-    const { data: existing } = await window.supabaseClient.from('wrestler_points').select('name');
-    (existing || []).forEach(r => {
-      existingByLower[r.name.toLowerCase().trim()] = r.name;
-    });
-  } catch (e) {}
+  // Match the name already in the database (any capitals) so we update that row instead of making a twin.
+  const { data: existing, error: rErr } = await sb.from('wrestler_points').select('name, updated_at').order('updated_at', { ascending: true, nullsFirst: true });
+  if (rErr) return { ok: false, error: 'Could not read current points: ' + rErr.message, saved: 0, total: want.length + failed.length, failed: failed.concat(want.map(w => ({ ...w, reason: 'not saved' }))) };
+  const canon = {};
+  (existing || []).forEach(r => { canon[String(r.name).toLowerCase().trim()] = r.name; });
+  const now = new Date().toISOString();
+  const rows = want.map(w => ({ name: canon[w.name.toLowerCase()] || w.name, points: w.points, updated_at: now }));
 
-  rows.forEach(r => {
-    const canon = existingByLower[r.name.toLowerCase()];
-    if (canon) r.name = canon;
-  });
+  const { error } = await sb.from('wrestler_points').upsert(rows, { onConflict: 'name' });
+  if (error) console.error('Bulk wrestler points error:', error);
 
-  const { error } = await window.supabaseClient
-    .from('wrestler_points')
-    .upsert(rows, { onConflict: 'name' });
-
-  if (error) {
-    console.error('Bulk wrestler points error:', error);
-    // Fallback: one-by-one so partial success still works
-    let saved = 0;
-    const failed = [];
-    for (const r of rows) {
-      const { error: e2 } = await window.supabaseClient
-        .from('wrestler_points')
-        .upsert(r, { onConflict: 'name' });
-      if (e2) {
-        failed.push(r.name + ': ' + e2.message);
-      } else {
-        data.wrestlerPoints[r.name.toLowerCase().trim()] = r.points;
-        saved++;
-      }
+  // Verify: re-read and compare every row we meant to save.
+  const { data: after, error: vErr } = await sb.from('wrestler_points').select('name, points');
+  const got = {};
+  (after || []).forEach(r => { got[String(r.name).toLowerCase().trim()] = Number(r.points); });
+  let saved = 0;
+  for (const r of rows) {
+    const k = r.name.toLowerCase().trim();
+    if (!vErr && got[k] === r.points) {
+      if (data.wrestlerPoints) data.wrestlerPoints[k] = r.points;
+      saved++;
+    } else {
+      failed.push({ name: r.name, points: r.points, reason: vErr ? 'could not double-check' : (error ? error.message : 'did not stick') });
     }
-    return { ok: failed.length === 0, error: failed.join('; '), saved, total: rows.length };
   }
+  return { ok: failed.length === 0, saved, total: rows.length + failed.filter(f => f.reason === 'could not read this line').length, failed, error: failed.map(f => f.name + ' (' + f.reason + ')').join('; ') };
+}
 
-  rows.forEach(r => {
-    data.wrestlerPoints[r.name.toLowerCase().trim()] = r.points;
-  });
-  return { ok: true, saved: rows.length, total: rows.length };
+/** Shows the save result in the score message box, with a Retry button for any failed names. */
+function showWrestlerSaveResult(msg, result, onRetry) {
+  if (!msg) return;
+  if (result.ok) {
+    msg.textContent = 'Saved and double-checked ' + result.saved + ' wrestler' + (result.saved === 1 ? '' : 's') + '.';
+    msg.className = 'text-sm text-emerald-400';
+    return;
+  }
+  const esc = (x) => String(x).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const list = (result.failed || []).map(f => '<li>' + esc(f.name) + (f.points !== undefined && !isNaN(parseInt(f.points, 10)) ? ' ' + esc(f.points) : '') + ' \u2014 ' + esc(f.reason) + '</li>').join('');
+  msg.className = 'text-sm text-red-400';
+  msg.innerHTML = '<div class="font-bold">Saved ' + (result.saved || 0) + '. These did NOT save:</div><ul class="list-disc ml-5">' + list + '</ul>' +
+    (result.error && !(result.failed || []).length ? '<div>' + esc(result.error) + '</div>' : '') +
+    '<button type="button" id="wp-retry-btn" class="mt-2 bg-aew-gold text-black font-bold px-3 py-1 rounded">Retry these</button>';
+  const retryable = (result.failed || []).filter(f => f.reason !== 'could not read this line');
+  const btn = document.getElementById('wp-retry-btn');
+  if (btn) {
+    if (!retryable.length) btn.remove();
+    else btn.addEventListener('click', () => onRetry(retryable.map(f => ({ name: f.name, points: f.points }))));
+  }
 }
 
 
@@ -6390,18 +6399,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (msg) { msg.textContent = 'Enter name and points'; msg.className = 'text-sm text-red-400'; }
       return;
     }
-    const result = await saveWrestlerPointsBulk([{ name, points: pts }]);
-    await loadWrestlerPoints();
-  await loadPortraits();
-    if (msg) {
-      if (result.ok) {
-        msg.textContent = `Updated ${name} to ${pts} pts`;
-        msg.className = 'text-sm text-emerald-400';
-      } else {
-        msg.textContent = 'Error: ' + (result.error || 'save failed');
-        msg.className = 'text-sm text-red-400';
-      }
-    }
+    const runOne = async (list) => {
+      const result = await saveWrestlerPointsBulk(list);
+      await loadWrestlerPoints();
+      await loadPortraits();
+      showWrestlerSaveResult(msg, result, runOne);
+    };
+    await runOne([{ name, points: pts }]);
     document.getElementById('wp-name').value = '';
     document.getElementById('wp-points').value = '';
   });
@@ -6412,24 +6416,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     text.split('\n').forEach(line => {
       line = line.trim();
       if (!line) return;
-      const m = line.match(/^(.+)\s+(-?\d+)$/);
+      const m = line.match(/^(.+?)(?:\s*[:,=]\s*|\s+)(-?\d+)$/);
       if (m) updates.push({ name: m[1].trim(), points: parseInt(m[2], 10) });
+      else updates.push({ name: line, points: NaN, raw: line }); // never silently skip a line
     });
-    if (!updates.length) return alert('No valid lines (format: Name 12)');
+    if (!updates.length) return alert('No lines to save (format: Name 12)');
     const msg = document.getElementById('wp-msg');
-    if (msg) { msg.textContent = 'Saving ' + updates.length + ' wrestlers...'; msg.className = 'text-sm text-yellow-400'; }
-    const result = await saveWrestlerPointsBulk(updates);
-    await loadWrestlerPoints();
-  await loadPortraits(); // confirm from DB
-    if (msg) {
-      if (result.ok) {
-        msg.textContent = 'Saved ' + result.saved + ' wrestlers';
-        msg.className = 'text-sm text-emerald-400';
-      } else {
-        msg.textContent = 'Saved ' + (result.saved || 0) + '/' + (result.total || updates.length) + '. ' + (result.error || '');
-        msg.className = 'text-sm text-red-400';
-      }
-    }
+    const run = async (list) => {
+      if (msg) { msg.textContent = 'Saving ' + list.length + ' wrestlers...'; msg.className = 'text-sm text-yellow-400'; }
+      const result = await saveWrestlerPointsBulk(list);
+      await loadWrestlerPoints();
+      await loadPortraits();
+      showWrestlerSaveResult(msg, result, run);
+    };
+    await run(updates);
   });
 
   document.getElementById('save-autopick')?.addEventListener('click', saveAutopickList);
@@ -7195,14 +7195,16 @@ async function approveShowImport() {
     // 1) wrestler_points upsert add
     for (const [name, p] of Object.entries(currentShowImport.pointsMap)) {
       if (!p.total) continue;
-      const { data: existing } = await sb.from('wrestler_points').select('name, points').ilike('name', name).maybeSingle();
+      const esc = String(name).trim().replace(/[\\%_]/g, m => '\\' + m);
+      const { data: found, error: fErr } = await sb.from('wrestler_points').select('name, points, updated_at').ilike('name', esc).order('updated_at', { ascending: false, nullsFirst: false }).limit(1);
+      if (fErr) throw new Error('Could not read points for ' + name + ': ' + fErr.message);
+      const existing = (found || [])[0];
       const prev = existing?.points || 0;
       const next = prev + p.total;
-      if (existing) {
-        await sb.from('wrestler_points').update({ points: next }).eq('name', existing.name);
-      } else {
-        await sb.from('wrestler_points').insert({ name, points: next });
-      }
+      const { error: wErr } = existing
+        ? await sb.from('wrestler_points').update({ points: next, updated_at: new Date().toISOString() }).eq('name', existing.name)
+        : await sb.from('wrestler_points').insert({ name: String(name).trim(), points: next, updated_at: new Date().toISOString() });
+      if (wErr) throw new Error('Could not save points for ' + name + ': ' + wErr.message);
     }
 
     // 2) team totals: sum points for wrestlers on each roster + player bonuses

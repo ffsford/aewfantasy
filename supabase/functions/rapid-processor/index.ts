@@ -41,19 +41,63 @@ function leagueDivisions(
 }
 
 
-// Waiver report layout (same function as formatWaiverReport() in app.js):
-// "MOVES MADE" first (one line per successful claim), then "DETAILS" with every other
-// line in original order, identical lines collapsed to one with "(xN)". Nothing is dropped.
-function formatWaiverReport(lines: string[]): string {
-  const clean = lines.map((l) => String(l).replace(/<[^>]+>/g, "").trim()).filter(Boolean);
+// Waiver report layout (same logic as formatWaiverReport() in app.js):
+// "MOVES MADE" first, grouped by division (division_setup order, custom names, unknown -> OTHER;
+// teams in standings order), then "DETAILS" grouped the same way with identical lines
+// collapsed to one "(xN)". Nothing is dropped.
+function formatWaiverReport(lines: string[], ctx?: any): string {
+  const clean = (lines || []).map((l: string) => String(l).replace(/<[^>]+>/g, "").trim()).filter(Boolean);
   if (!clean.length) return "No successful claims this run.";
-  const moves = clean.filter((l) => l.startsWith("\u2705"));
-  const counts = new Map<string, number>();
-  for (const l of clean) if (!l.startsWith("\u2705")) counts.set(l, (counts.get(l) || 0) + 1);
-  const details = [...counts.entries()].map(([l, n]) => (n > 1 ? `${l} (x${n})` : l));
-  return `MOVES MADE (${moves.length})\n` + (moves.length ? moves.join("\n") : "None") +
-    (details.length ? "\n\nDETAILS\n" + details.join("\n") : "");
+  const isMove = (l: string) => l.startsWith("\u2705");
+  const dedupe = (arr: string[]) => {
+    const counts = new Map<string, number>();
+    arr.forEach((l: string) => counts.set(l, (counts.get(l) || 0) + 1));
+    return [...counts.entries()].map(([l, n]: [string, number]) => (n > 1 ? `${l} (x${n})` : l));
+  };
+  const moves = clean.filter(isMove);
+  const others = clean.filter((l: string) => !isMove(l));
+  const teams = (ctx && Array.isArray(ctx.teams)) ? ctx.teams : null;
+  if (!teams || !teams.length) {
+    const details = dedupe(others);
+    return `MOVES MADE (${moves.length})\n` + (moves.length ? moves.join("\n") : "None") +
+      (details.length ? "\n\nDETAILS\n" + details.join("\n") : "");
+  }
+  // Group by each team's current division; teams in standings order (most points first).
+  const divs = ((ctx && ctx.divisions) || []).map((d: any) => ({ slug: String(d.slug || "").toLowerCase(), label: String(d.label || d.slug || "").toUpperCase() }));
+  const teamInfo = new Map<string, any>();
+  teams.forEach((t: any) => teamInfo.set(String(t.name || "").toUpperCase(), { div: String(t.division || "").toLowerCase(), points: Number(t.points) || 0 }));
+  const groupsOrder = divs.map((d: any) => d.slug);
+  teams.forEach((t: any) => { const s = String(t.division || "").toLowerCase(); if (s && !groupsOrder.includes(s)) groupsOrder.push(s); });
+  const labelOf = (slug: string) => (divs.find((d: any) => d.slug === slug) || { label: slug.toUpperCase() }).label || "OTHER";
+  const teamOf = (l: string) => { const m = l.match(/^\S+\s+(\S+)/); return m ? m[1].toUpperCase() : ""; };
+  const group = (arr: string[]): { label: string; lines: string[] }[] => {
+    const by = new Map<string, any[]>();
+    arr.forEach((l: string, i: number) => {
+      const t = teamOf(l); const info = teamInfo.get(t);
+      const g = info && info.div ? info.div : "__other";
+      if (!by.has(g)) by.set(g, []);
+      by.get(g).push({ l, i, t, pts: info ? info.points : -Infinity });
+    });
+    const keys = groupsOrder.filter((g: any) => by.has(g)).concat(by.has("__other") ? ["__other"] : []);
+    return keys.map((g: any) => {
+      const items = by.get(g);
+      const firstIdx = new Map<string, number>();
+      items.forEach((x: any) => { if (!firstIdx.has(x.t)) firstIdx.set(x.t, x.i); });
+      items.sort((a: any, b: any) => (b.pts - a.pts) || (firstIdx.get(a.t) - firstIdx.get(b.t)) || (a.i - b.i));
+      return { label: g === "__other" ? "OTHER" : labelOf(g), lines: items.map((x: any) => x.l) };
+    });
+  };
+  let out = `MOVES MADE (${moves.length})`;
+  if (!moves.length) out += "\nNone";
+  group(moves).forEach((g: any) => { out += `\n${g.label} (${g.lines.length})\n` + g.lines.join("\n"); });
+  const dg = group(others);
+  if (dg.length) {
+    out += "\n\nDETAILS";
+    dg.forEach((g: any) => { out += `\n${g.label}\n` + dedupe(g.lines).join("\n"); });
+  }
+  return out;
 }
+
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -302,7 +346,15 @@ Deno.serve(async (req) => {
       }
     }
 
-    const reportText = formatWaiverReport(results);
+    let setupNames: any[] = [];
+    try { setupNames = (JSON.parse(modeMap["division_setup"] || "null") || {}).names || []; } catch { setupNames = []; }
+    const reportText = formatWaiverReport(results, {
+      divisions: league.slugs.map((slug) => {
+        const hit = setupNames.find((n: any) => String(n?.slug || "").toLowerCase() === slug.toLowerCase());
+        return { slug, label: (hit && hit.name) ? String(hit.name) : slug };
+      }),
+      teams: (teams || []).map((t: any) => ({ name: t.name, division: t.division, points: t.points || 0 })),
+    });
 
     await supabase.from("waiver_reports").insert({
       division: "both",

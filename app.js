@@ -3209,23 +3209,85 @@ async function processWaivers(opts = {}) {
 
 // ----- Waiver report layout + copy (same layout as formatWaiverReport() in rapid-processor) -----
 const WAIVER_ALERT_HEADER = 'WAIVER WIRE AUTO-RUN COMPLETE';
-function formatWaiverReport(lines) {
-  const clean = (lines || []).map(l => String(l).replace(/<[^>]+>/g, '').trim()).filter(Boolean);
+function formatWaiverReport(lines, ctx) {
+  const clean = (lines || []).map((l) => String(l).replace(/<[^>]+>/g, '').trim()).filter(Boolean);
   if (!clean.length) return 'No successful claims this run.';
-  const moves = clean.filter(l => l.startsWith('\u2705'));
-  const counts = new Map();
-  clean.forEach(l => { if (!l.startsWith('\u2705')) counts.set(l, (counts.get(l) || 0) + 1); });
-  const details = [...counts.entries()].map(([l, n]) => n > 1 ? `${l} (x${n})` : l);
-  return `MOVES MADE (${moves.length})\n` + (moves.length ? moves.join('\n') : 'None') +
-    (details.length ? '\n\nDETAILS\n' + details.join('\n') : '');
+  const isMove = (l) => l.startsWith('\u2705');
+  const dedupe = (arr) => {
+    const counts = new Map();
+    arr.forEach((l) => counts.set(l, (counts.get(l) || 0) + 1));
+    return [...counts.entries()].map(([l, n]) => (n > 1 ? `${l} (x${n})` : l));
+  };
+  const moves = clean.filter(isMove);
+  const others = clean.filter((l) => !isMove(l));
+  const teams = (ctx && Array.isArray(ctx.teams)) ? ctx.teams : null;
+  if (!teams || !teams.length) {
+    const details = dedupe(others);
+    return `MOVES MADE (${moves.length})\n` + (moves.length ? moves.join('\n') : 'None') +
+      (details.length ? '\n\nDETAILS\n' + details.join('\n') : '');
+  }
+  // Group by each team's current division; teams in standings order (most points first).
+  const divs = ((ctx && ctx.divisions) || []).map((d) => ({ slug: String(d.slug || '').toLowerCase(), label: String(d.label || d.slug || '').toUpperCase() }));
+  const teamInfo = new Map();
+  teams.forEach((t) => teamInfo.set(String(t.name || '').toUpperCase(), { div: String(t.division || '').toLowerCase(), points: Number(t.points) || 0 }));
+  const groupsOrder = divs.map((d) => d.slug);
+  teams.forEach((t) => { const s = String(t.division || '').toLowerCase(); if (s && !groupsOrder.includes(s)) groupsOrder.push(s); });
+  const labelOf = (slug) => (divs.find((d) => d.slug === slug) || { label: slug.toUpperCase() }).label || 'OTHER';
+  const teamOf = (l) => { const m = l.match(/^\S+\s+(\S+)/); return m ? m[1].toUpperCase() : ''; };
+  const group = (arr) => {
+    const by = new Map();
+    arr.forEach((l, i) => {
+      const t = teamOf(l); const info = teamInfo.get(t);
+      const g = info && info.div ? info.div : '__other';
+      if (!by.has(g)) by.set(g, []);
+      by.get(g).push({ l, i, t, pts: info ? info.points : -Infinity });
+    });
+    const keys = groupsOrder.filter((g) => by.has(g)).concat(by.has('__other') ? ['__other'] : []);
+    return keys.map((g) => {
+      const items = by.get(g);
+      const firstIdx = new Map();
+      items.forEach((x) => { if (!firstIdx.has(x.t)) firstIdx.set(x.t, x.i); });
+      items.sort((a, b) => (b.pts - a.pts) || (firstIdx.get(a.t) - firstIdx.get(b.t)) || (a.i - b.i));
+      return { label: g === '__other' ? 'OTHER' : labelOf(g), lines: items.map((x) => x.l) };
+    });
+  };
+  let out = `MOVES MADE (${moves.length})`;
+  if (!moves.length) out += '\nNone';
+  group(moves).forEach((g) => { out += `\n${g.label} (${g.lines.length})\n` + g.lines.join('\n'); });
+  const dg = group(others);
+  if (dg.length) {
+    out += '\n\nDETAILS';
+    dg.forEach((g) => { out += `\n${g.label}\n` + dedupe(g.lines).join('\n'); });
+  }
+  return out;
 }
+
 /** Any stored report (old flat list, new layout, or app-run with <strong>) -> new plain-text layout. */
 function normalizeWaiverReportText(text) {
   let t = String(text || '').replace(/<[^>]+>/g, '');
   t = t.replace(new RegExp('^\\s*' + WAIVER_ALERT_HEADER + '\\s*'), '');
-  if (/^\s*MOVES MADE \(\d+\)/.test(t)) return t.trim();
   if (/^\s*No successful claims this run\.?\s*$/.test(t)) return 'No successful claims this run.';
-  return formatWaiverReport(t.split('\n'));
+  let lines = t.split('\n');
+  if (/^\s*MOVES MADE \(\d+\)/.test(t)) {
+    // Already new layout: expand "(xN)" and drop headings, then regroup with current divisions.
+    lines = lines.filter(l => /^\S*[\u2705\u21aa\u26a0\u274c\ud83d\udeab]/.test(l.trim())).flatMap(l => {
+      const m = l.trim().match(/^(.*) \(x(\d+)\)$/);
+      return m ? Array(Number(m[2])).fill(m[1]) : [l.trim()];
+    });
+  }
+  return formatWaiverReport(lines, waiverReportContext());
+}
+function waiverReportContext() {
+  const slugs = (typeof getLeagueDivisions === 'function' ? getLeagueDivisions() : []) || [];
+  const names = (data.divisionSetup && Array.isArray(data.divisionSetup.names)) ? data.divisionSetup.names : [];
+  return {
+    divisions: slugs.map(slug => {
+      const hit = names.find(n => String(n.slug).toLowerCase() === String(slug).toLowerCase());
+      return { slug, label: hit && hit.name ? hit.name : slug };
+    }),
+    teams: Object.entries(data.users || {}).filter(([, u]) => u && u.name && !u.readOnly)
+      .map(([pin, u]) => ({ name: u.name, division: u.division, points: (data.points || {})[pin] || 0 }))
+  };
 }
 function isWaiverAlert(message) { return String(message || '').trim().startsWith(WAIVER_ALERT_HEADER); }
 async function copyTextToClipboard(text) {

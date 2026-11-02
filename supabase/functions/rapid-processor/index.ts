@@ -40,6 +40,21 @@ function leagueDivisions(
   return { slugs: ["east", "west"], count: 2 };
 }
 
+
+// Waiver report layout (same function as formatWaiverReport() in app.js):
+// "MOVES MADE" first (one line per successful claim), then "DETAILS" with every other
+// line in original order, identical lines collapsed to one with "(xN)". Nothing is dropped.
+function formatWaiverReport(lines: string[]): string {
+  const clean = lines.map((l) => String(l).replace(/<[^>]+>/g, "").trim()).filter(Boolean);
+  if (!clean.length) return "No successful claims this run.";
+  const moves = clean.filter((l) => l.startsWith("\u2705"));
+  const counts = new Map<string, number>();
+  for (const l of clean) if (!l.startsWith("\u2705")) counts.set(l, (counts.get(l) || 0) + 1);
+  const details = [...counts.entries()].map(([l, n]) => (n > 1 ? `${l} (x${n})` : l));
+  return `MOVES MADE (${moves.length})\n` + (moves.length ? moves.join("\n") : "None") +
+    (details.length ? "\n\nDETAILS\n" + details.join("\n") : "");
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -287,8 +302,7 @@ Deno.serve(async (req) => {
       }
     }
 
-    const reportText =
-      results.length > 0 ? results.join("\n") : "No successful claims this run.";
+    const reportText = formatWaiverReport(results);
 
     await supabase.from("waiver_reports").insert({
       division: "both",

@@ -3207,6 +3207,66 @@ async function processWaivers(opts = {}) {
   return { ok: true, results };
 }
 
+// ----- Waiver report layout + copy (same layout as formatWaiverReport() in rapid-processor) -----
+const WAIVER_ALERT_HEADER = 'WAIVER WIRE AUTO-RUN COMPLETE';
+function formatWaiverReport(lines) {
+  const clean = (lines || []).map(l => String(l).replace(/<[^>]+>/g, '').trim()).filter(Boolean);
+  if (!clean.length) return 'No successful claims this run.';
+  const moves = clean.filter(l => l.startsWith('\u2705'));
+  const counts = new Map();
+  clean.forEach(l => { if (!l.startsWith('\u2705')) counts.set(l, (counts.get(l) || 0) + 1); });
+  const details = [...counts.entries()].map(([l, n]) => n > 1 ? `${l} (x${n})` : l);
+  return `MOVES MADE (${moves.length})\n` + (moves.length ? moves.join('\n') : 'None') +
+    (details.length ? '\n\nDETAILS\n' + details.join('\n') : '');
+}
+/** Any stored report (old flat list, new layout, or app-run with <strong>) -> new plain-text layout. */
+function normalizeWaiverReportText(text) {
+  let t = String(text || '').replace(/<[^>]+>/g, '');
+  t = t.replace(new RegExp('^\\s*' + WAIVER_ALERT_HEADER + '\\s*'), '');
+  if (/^\s*MOVES MADE \(\d+\)/.test(t)) return t.trim();
+  if (/^\s*No successful claims this run\.?\s*$/.test(t)) return 'No successful claims this run.';
+  return formatWaiverReport(t.split('\n'));
+}
+function isWaiverAlert(message) { return String(message || '').trim().startsWith(WAIVER_ALERT_HEADER); }
+async function copyTextToClipboard(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return true; }
+  } catch (e) { /* fall through */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.top = '0'; ta.style.left = '0'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.focus(); ta.select(); ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand && document.execCommand('copy');
+    ta.remove();
+    if (ok) return true;
+  } catch (e) { /* fall through */ }
+  return false;
+}
+/** Copy with a "Copied!" label; if the browser blocks copying, show the text selected so it can be copied by hand. */
+async function copyWithFeedback(btn, text) {
+  const ok = await copyTextToClipboard(text);
+  if (btn) {
+    const old = btn.dataset.label || btn.textContent;
+    btn.dataset.label = old;
+    btn.textContent = ok ? 'Copied!' : 'Select & copy below';
+    setTimeout(() => { btn.textContent = old; }, 2000);
+  }
+  if (!ok) {
+    let box = document.getElementById('copy-fallback-box');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'copy-fallback-box';
+      box.className = 'fixed inset-x-0 bottom-0 z-[200] bg-gray-900 border-t border-aew-gold p-3';
+      box.innerHTML = '<div class="text-xs text-gray-300 mb-1">Copying is blocked here. Text is selected \u2014 long-press or Ctrl+C to copy.</div><textarea class="w-full h-40 bg-black text-white text-sm p-2 rounded"></textarea><button type="button" class="mt-2 bg-gray-700 px-3 py-1 rounded text-sm">Close</button>';
+      document.body.appendChild(box);
+      box.querySelector('button').addEventListener('click', () => box.remove());
+    }
+    const ta = box.querySelector('textarea');
+    ta.value = text; ta.focus(); ta.select();
+  }
+  return ok;
+}
+
 async function renderWaiverReports() {
   const el = document.getElementById('waiver-reports-list');
   if (!el) return;
@@ -3219,12 +3279,26 @@ async function renderWaiverReports() {
     el.innerHTML = '<p class="text-gray-500 text-sm">No waiver runs yet</p>';
     return;
   }
-  el.innerHTML = rows.map(r => `
+  const esc = (x) => String(x).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  el.innerHTML = rows.map((r, i) => {
+    const text = normalizeWaiverReportText(r.report);
+    const cut = text.indexOf('\n\nDETAILS\n');
+    const top = cut >= 0 ? text.slice(0, cut) : text;
+    const details = cut >= 0 ? text.slice(cut + 2) : '';
+    return `
     <div class="bg-black/40 rounded-lg px-3 py-2 border border-gray-800 mb-2">
-      <div class="text-xs text-gray-500 mb-1">${new Date(r.created_at).toLocaleString()}</div>
-      <pre class="text-sm text-gray-300 whitespace-pre-wrap font-sans">${r.report}</pre>
-    </div>
-  `).join('');
+      <div class="flex items-center justify-between gap-2 mb-1">
+        <div class="text-xs text-gray-500">${new Date(r.created_at).toLocaleString()}</div>
+        <button type="button" class="wr-copy text-xs bg-gray-700 hover:bg-gray-600 px-2 py-0.5 rounded" data-idx="${i}">Copy report</button>
+      </div>
+      <pre class="text-sm text-gray-200 whitespace-pre-wrap font-sans select-text">${esc(top)}</pre>
+      ${details ? `<details class="mt-1"><summary class="text-xs text-gray-400 cursor-pointer">Details</summary><pre class="text-xs text-gray-400 whitespace-pre-wrap font-sans select-text">${esc(details)}</pre></details>` : ''}
+    </div>`;
+  }).join('');
+  el.querySelectorAll('.wr-copy').forEach(btn => btn.addEventListener('click', () => {
+    const r = rows[Number(btn.dataset.idx)];
+    copyWithFeedback(btn, WAIVER_ALERT_HEADER + ' \u2014 ' + new Date(r.created_at).toLocaleString() + '\n\n' + normalizeWaiverReportText(r.report));
+  }));
 }
 
 
@@ -5663,7 +5737,17 @@ function showNextAlert() {
 
   const alert = pendingBroadcasts[0];
   currentAlertId = alert.id;
-  msgEl.textContent = alert.message;
+  const copyBtn = document.getElementById('red-alert-copy');
+  if (isWaiverAlert(alert.message)) {
+    const full = WAIVER_ALERT_HEADER + '\n\n' + normalizeWaiverReportText(alert.message);
+    msgEl.textContent = full;
+    msgEl.scrollTop = 0;
+    if (copyBtn) { copyBtn.classList.remove('hidden'); copyBtn.onclick = () => copyWithFeedback(copyBtn, full); }
+  } else {
+    msgEl.textContent = alert.message;
+    msgEl.scrollTop = 0;
+    if (copyBtn) { copyBtn.classList.add('hidden'); copyBtn.onclick = null; }
+  }
   modal.classList.remove('hidden');
 }
 

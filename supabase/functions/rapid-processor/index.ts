@@ -41,13 +41,69 @@ function leagueDivisions(
 }
 
 
+// ----- Waiver order + system coin flip for ties -----
+// Fewest team points first. Teams tied on points are put in a random order drawn at run
+// time with crypto.getRandomValues (a fair coin flip for two teams, a random draw for 3+).
+// Internal team ids are never used to break ties.
+function secureRandomInt(n: number): number {
+  // Unbiased integer in [0, n) via rejection sampling.
+  const limit = Math.floor(0x100000000 / n) * n;
+  const buf = new Uint32Array(1);
+  for (;;) {
+    crypto.getRandomValues(buf);
+    if (buf[0] < limit) return buf[0] % n;
+  }
+}
+function secureShuffle<T>(arr: T[]): T[] {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = secureRandomInt(i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+function buildWaiverOrder(teams: { pin: string; name: string; points: number }[]) {
+  const byPts = new Map<number, any[]>();
+  teams.forEach((t) => { if (!byPts.has(t.points)) byPts.set(t.points, []); byPts.get(t.points)!.push(t); });
+  const order: any[] = [];
+  const ties: { points: number; names: string[] }[] = [];
+  [...byPts.keys()].sort((a, b) => a - b).forEach((p) => {
+    const g = byPts.get(p)!;
+    if (g.length > 1) {
+      const drawn = secureShuffle(g);
+      ties.push({ points: p, names: drawn.map((t: any) => t.name) });
+      order.push(...drawn);
+    } else order.push(g[0]);
+  });
+  return { order, ties };
+}
+// e.g. "\u{1F522} WEST order: DEVIN 501, FORD 516, VEGAS 538, CLIFF 538 (tie broken by coin flip: VEGAS won)"
+function waiverOrderLine(label: string, order: any[], ties: { points: number; names: string[] }[]): string {
+  let line = `\u{1F522} ${String(label).toUpperCase()} order: ` +
+    (order.length ? order.map((t: any) => `${t.name} ${t.points}`).join(", ") : "no teams");
+  if (ties.length) {
+    const many = ties.length > 1;
+    const parts = ties.map((t) => t.names.length === 2
+      ? `${t.names[0]} won` + (many ? ` at ${t.points}` : "")
+      : `${t.names.join(", ")} drawn in that order` + (many ? ` at ${t.points}` : ""));
+    line += ` (${many ? "ties" : "tie"} broken by coin flip: ${parts.join("; ")})`;
+  }
+  return line;
+}
+
+
 // Waiver report layout (same logic as formatWaiverReport() in app.js):
 // "MOVES MADE" first, grouped by division (division_setup order, custom names, unknown -> OTHER;
 // teams in standings order), then "DETAILS" grouped the same way with identical lines
 // collapsed to one "(xN)". Nothing is dropped.
 function formatWaiverReport(lines: string[], ctx?: any): string {
-  const clean = (lines || []).map((l: string) => String(l).replace(/<[^>]+>/g, "").trim()).filter(Boolean);
-  if (!clean.length) return "No successful claims this run.";
+  const all = (lines || []).map((l: string) => String(l).replace(/<[^>]+>/g, "").trim()).filter(Boolean);
+  if (!all.length) return "No successful claims this run.";
+  // Waiver order lines ("\u{1F522} WEST order: ...") go at the top of their division's section.
+  const isOrder = (l: string) => l.startsWith("\u{1F522}");
+  const orderLines = all.filter(isOrder);
+  const clean = all.filter((l: string) => !isOrder(l));
+  const orderLabel = (l: string) => { const m = l.match(/^\S+\s+(.+?) order:/); return m ? m[1].toUpperCase() : ""; };
   const isMove = (l: string) => l.startsWith("\u2705");
   const dedupe = (arr: string[]) => {
     const counts = new Map<string, number>();
@@ -59,7 +115,7 @@ function formatWaiverReport(lines: string[], ctx?: any): string {
   const teams = (ctx && Array.isArray(ctx.teams)) ? ctx.teams : null;
   if (!teams || !teams.length) {
     const details = dedupe(others);
-    return `MOVES MADE (${moves.length})\n` + (moves.length ? moves.join("\n") : "None") +
+    return `MOVES MADE (${moves.length})\n` + orderLines.map((l: string) => l + "\n").join("") + (moves.length ? moves.join("\n") : "None") +
       (details.length ? "\n\nDETAILS\n" + details.join("\n") : "");
   }
   // Group by each team's current division; teams in standings order (most points first).
@@ -88,8 +144,19 @@ function formatWaiverReport(lines: string[], ctx?: any): string {
     });
   };
   let out = `MOVES MADE (${moves.length})`;
-  if (!moves.length) out += "\nNone";
-  group(moves).forEach((g: any) => { out += `\n${g.label} (${g.lines.length})\n` + g.lines.join("\n"); });
+  const mg = group(moves);
+  const divLabels = groupsOrder.map((g: string) => labelOf(g)).filter((lab: string, i: number, a: string[]) => a.indexOf(lab) === i);
+  const sections = divLabels
+    .map((lab: string) => ({ label: lab, lines: (mg.find((g: any) => g.label === lab) || { lines: [] }).lines }))
+    .concat(mg.filter((g: any) => !divLabels.includes(g.label)));
+  // Order lines for no known division (shared roster "LEAGUE order") sit right under MOVES MADE.
+  orderLines.filter((l: string) => !sections.some((g: any) => g.label === orderLabel(l))).forEach((l: string) => { out += "\n" + l; });
+  if (!moves.length && !orderLines.length) out += "\nNone";
+  sections.filter((g: any) => g.lines.length || orderLines.some((l: string) => orderLabel(l) === g.label)).forEach((g: any) => {
+    out += `\n${g.label} (${g.lines.length})`;
+    orderLines.filter((l: string) => orderLabel(l) === g.label).forEach((l: string) => { out += "\n" + l; });
+    out += g.lines.length ? "\n" + g.lines.join("\n") : "\nNone";
+  });
   const dg = group(others);
   if (dg.length) {
     out += "\n\nDETAILS";
@@ -222,6 +289,12 @@ Deno.serve(async (req) => {
 
     // Separate rosters: each division runs on its own (original behavior, east then west).
     // Shared roster: one league-wide pass, worst points first across the league.
+    let setupNames: any[] = [];
+    try { setupNames = (JSON.parse(modeMap["division_setup"] || "null") || {}).names || []; } catch { setupNames = []; }
+    const divisionLabel = (slug: string) => {
+      const hit = setupNames.find((n: any) => String(n?.slug || "").toLowerCase() === String(slug).toLowerCase());
+      return (hit && hit.name) ? String(hit.name) : slug;
+    };
     const groups: string[][] = shared ? [league.slugs] : league.slugs.map((d) => [d]);
 
     const results: string[] = [];
@@ -238,17 +311,16 @@ Deno.serve(async (req) => {
         if (sett?.value) disrupters[d] = sett.value;
       }
 
-      const order = Object.entries(users)
+      const eligible = Object.entries(users)
         .filter(([_, u]) => groupDivs.includes(u.division) && !u.purged)
         .map(([pin, u]) => ({
           pin,
           name: u.name,
           points: points[pin] || 0,
-        }))
-        .sort(
-          (a, b) =>
-            a.points - b.points || String(a.pin).localeCompare(String(b.pin)),
-        );
+        }));
+      // Fewest points first; ties broken by a system coin flip right now (not by team id).
+      const { order, ties } = buildWaiverOrder(eligible);
+      results.push(waiverOrderLine(groupDivs.length === 1 ? divisionLabel(groupDivs[0]) : "LEAGUE", order, ties));
 
       for (const team of order) {
         const claim = claimMap[team.pin];
@@ -346,13 +418,8 @@ Deno.serve(async (req) => {
       }
     }
 
-    let setupNames: any[] = [];
-    try { setupNames = (JSON.parse(modeMap["division_setup"] || "null") || {}).names || []; } catch { setupNames = []; }
     const reportText = formatWaiverReport(results, {
-      divisions: league.slugs.map((slug) => {
-        const hit = setupNames.find((n: any) => String(n?.slug || "").toLowerCase() === slug.toLowerCase());
-        return { slug, label: (hit && hit.name) ? String(hit.name) : slug };
-      }),
+      divisions: league.slugs.map((slug) => ({ slug, label: divisionLabel(slug) })),
       teams: (teams || []).map((t: any) => ({ name: t.name, division: t.division, points: t.points || 0 })),
     });
 

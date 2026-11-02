@@ -3052,6 +3052,42 @@ async function tryAutoProcessWaivers() {
   }
 }
 
+// ----- Waiver order + system coin flip for ties (same as rapid-processor) -----
+// Fewest team points first. Teams tied on points get a random order drawn at run time with
+// crypto.getRandomValues (fair coin flip for two, random draw for 3+). Never by team id.
+function waiverSecureRandomInt(n) {
+  const limit = Math.floor(0x100000000 / n) * n;
+  const buf = new Uint32Array(1);
+  for (;;) { crypto.getRandomValues(buf); if (buf[0] < limit) return buf[0] % n; }
+}
+function waiverSecureShuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) { const j = waiverSecureRandomInt(i + 1); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+function buildWaiverOrder(teams) {
+  const byPts = new Map();
+  teams.forEach((t) => { if (!byPts.has(t.points)) byPts.set(t.points, []); byPts.get(t.points).push(t); });
+  const order = []; const ties = [];
+  [...byPts.keys()].sort((a, b) => a - b).forEach((p) => {
+    const g = byPts.get(p);
+    if (g.length > 1) { const drawn = waiverSecureShuffle(g); ties.push({ points: p, names: drawn.map((t) => t.name) }); order.push(...drawn); }
+    else order.push(g[0]);
+  });
+  return { order, ties };
+}
+function waiverOrderLine(label, order, ties) {
+  let line = `\u{1F522} ${String(label).toUpperCase()} order: ` + (order.length ? order.map((t) => `${t.name} ${t.points}`).join(', ') : 'no teams');
+  if (ties.length) {
+    const many = ties.length > 1;
+    const parts = ties.map((t) => t.names.length === 2
+      ? `${t.names[0]} won` + (many ? ` at ${t.points}` : '')
+      : `${t.names.join(', ')} drawn in that order` + (many ? ` at ${t.points}` : ''));
+    line += ` (${many ? 'ties' : 'tie'} broken by coin flip: ${parts.join('; ')})`;
+  }
+  return line;
+}
+
 async function processWaivers(opts = {}) {
   const silent = !!opts.silent;
   // Can only process AFTER deadline (claims no longer sealed)
@@ -3077,11 +3113,13 @@ async function processWaivers(opts = {}) {
   // pass so every claim competes for the same free agents.
   const waiverGroups = isSharedRosterPool() ? [getLeagueDivisions()] : getLeagueDivisions().map(d => [d]);
   for (const groupDivs of waiverGroups) {
-    // Worst → first (lowest points first). Tie: stable by pin for determinism
-    const order = Object.entries(data.users)
+    // Worst → first (lowest points first). Ties: system coin flip at run time (not team id).
+    const eligible = Object.entries(data.users)
       .filter(([_, u]) => groupDivs.includes(u.division) && !u.purged)
-      .map(([pin, u]) => ({ pin, name: u.name, points: data.points[pin] || 0 }))
-      .sort((a, b) => (a.points - b.points) || String(a.pin).localeCompare(String(b.pin)));
+      .map(([pin, u]) => ({ pin, name: u.name, points: data.points[pin] || 0 }));
+    const { order, ties } = buildWaiverOrder(eligible);
+    const divLabelOf = (slug) => { const hit = (waiverReportContext().divisions || []).find(d => String(d.slug).toLowerCase() === String(slug).toLowerCase()); return hit ? hit.label : slug; };
+    results.push(waiverOrderLine(groupDivs.length === 1 ? divLabelOf(groupDivs[0]) : 'LEAGUE', order, ties));
 
     // Waiver Disrupter is per division (blocks others in the activator's division)
     const disrupters = {};
@@ -3210,8 +3248,13 @@ async function processWaivers(opts = {}) {
 // ----- Waiver report layout + copy (same layout as formatWaiverReport() in rapid-processor) -----
 const WAIVER_ALERT_HEADER = 'WAIVER WIRE AUTO-RUN COMPLETE';
 function formatWaiverReport(lines, ctx) {
-  const clean = (lines || []).map((l) => String(l).replace(/<[^>]+>/g, '').trim()).filter(Boolean);
-  if (!clean.length) return 'No successful claims this run.';
+  const all = (lines || []).map((l) => String(l).replace(/<[^>]+>/g, '').trim()).filter(Boolean);
+  if (!all.length) return 'No successful claims this run.';
+  // Waiver order lines ("\u{1F522} WEST order: ...") go at the top of their division's section.
+  const isOrder = (l) => l.startsWith('\u{1F522}');
+  const orderLines = all.filter(isOrder);
+  const clean = all.filter((l) => !isOrder(l));
+  const orderLabel = (l) => { const m = l.match(/^\S+\s+(.+?) order:/); return m ? m[1].toUpperCase() : ''; };
   const isMove = (l) => l.startsWith('\u2705');
   const dedupe = (arr) => {
     const counts = new Map();
@@ -3223,7 +3266,7 @@ function formatWaiverReport(lines, ctx) {
   const teams = (ctx && Array.isArray(ctx.teams)) ? ctx.teams : null;
   if (!teams || !teams.length) {
     const details = dedupe(others);
-    return `MOVES MADE (${moves.length})\n` + (moves.length ? moves.join('\n') : 'None') +
+    return `MOVES MADE (${moves.length})\n` + orderLines.map((l) => l + '\n').join('') + (moves.length ? moves.join('\n') : 'None') +
       (details.length ? '\n\nDETAILS\n' + details.join('\n') : '');
   }
   // Group by each team's current division; teams in standings order (most points first).
@@ -3252,8 +3295,19 @@ function formatWaiverReport(lines, ctx) {
     });
   };
   let out = `MOVES MADE (${moves.length})`;
-  if (!moves.length) out += '\nNone';
-  group(moves).forEach((g) => { out += `\n${g.label} (${g.lines.length})\n` + g.lines.join('\n'); });
+  const mg = group(moves);
+  const divLabels = groupsOrder.map((g) => labelOf(g)).filter((lab, i, a) => a.indexOf(lab) === i);
+  const sections = divLabels
+    .map((lab) => ({ label: lab, lines: (mg.find((g) => g.label === lab) || { lines: [] }).lines }))
+    .concat(mg.filter((g) => !divLabels.includes(g.label)));
+  // Order lines for no known division (shared roster "LEAGUE order") sit right under MOVES MADE.
+  orderLines.filter((l) => !sections.some((g) => g.label === orderLabel(l))).forEach((l) => { out += '\n' + l; });
+  if (!moves.length && !orderLines.length) out += '\nNone';
+  sections.filter((g) => g.lines.length || orderLines.some((l) => orderLabel(l) === g.label)).forEach((g) => {
+    out += `\n${g.label} (${g.lines.length})`;
+    orderLines.filter((l) => orderLabel(l) === g.label).forEach((l) => { out += '\n' + l; });
+    out += g.lines.length ? '\n' + g.lines.join('\n') : '\nNone';
+  });
   const dg = group(others);
   if (dg.length) {
     out += '\n\nDETAILS';
@@ -3270,7 +3324,7 @@ function normalizeWaiverReportText(text) {
   let lines = t.split('\n');
   if (/^\s*MOVES MADE \(\d+\)/.test(t)) {
     // Already new layout: expand "(xN)" and drop headings, then regroup with current divisions.
-    lines = lines.filter(l => /^\S*[\u2705\u21aa\u26a0\u274c\ud83d\udeab]/.test(l.trim())).flatMap(l => {
+    lines = lines.filter(l => /^\S*[\u2705\u21aa\u26a0\u274c\ud83d\udeab\udd22]/.test(l.trim())).flatMap(l => {
       const m = l.trim().match(/^(.*) \(x(\d+)\)$/);
       return m ? Array(Number(m[2])).fill(m[1]) : [l.trim()];
     });

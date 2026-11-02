@@ -994,10 +994,11 @@ Jon Moxley def. Jay White | tournament:additional | fall:Jon Moxley"></textarea>
   </div>
 
     <!-- RED ALERT MODAL -->
-    <div id="red-alert-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
-      <div class="bg-gray-900 border-2 border-aew-red rounded-2xl max-w-md w-full p-6 shadow-2xl">
+    <div id="red-alert-modal" class="hidden fixed inset-0 z-50 flex items-start sm:items-center justify-center bg-black/80 p-4 overflow-y-auto">
+      <div class="bg-gray-900 border-2 border-aew-red rounded-2xl max-w-md w-full p-6 shadow-2xl my-auto flex flex-col" style="max-height:calc(100dvh - 2rem)">
         <div class="text-aew-red font-black text-xl mb-2 tracking-wide">RED ALERT</div>
-        <div id="red-alert-message" class="text-white text-base mb-6 whitespace-pre-wrap"></div>
+        <div id="red-alert-message" class="text-white text-base mb-6 whitespace-pre-wrap overflow-y-auto min-h-0" style="overscroll-behavior:contain"></div>
+        <button id="red-alert-copy" type="button" class="hidden w-full mb-2 bg-gray-700 hover:bg-gray-600 text-white font-bold py-2 rounded-lg">Copy report</button>
         <button id="red-alert-ok" class="w-full bg-aew-red hover:bg-red-700 text-white font-bold py-3 rounded-lg">OK</button>
       </div>
     </div>
